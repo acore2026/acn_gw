@@ -249,50 +249,77 @@ class TestACFWebSocketHandler:
     
     async def test_handle_websocket_setup_flow(self, acf_server):
         """Test complete WebSocket handling flow"""
-        mock_ws = AsyncMock()
-        
-        # Simulate receiving SETUP message
-        setup_msg = {
-            "type": "SETUP",
-            "payload": {"src_agent_id": "test-agent-flow"}
-        }
-        
-        # Create agent in DB
+        # Create agent in DB first
         db = SessionLocal()
         agent = Agent(agent_id="test-agent-flow")
         db.add(agent)
         db.commit()
         db.close()
         
-        # Configure mock to yield SETUP message then close
-        mock_ws.__aiter__ = AsyncMock(return_value=iter([json.dumps(setup_msg)]))
+        # Create a mock that properly supports async for
+        messages = [json.dumps({"type": "SETUP", "payload": {"src_agent_id": "test-agent-flow"}})]
+        
+        class MockWebSocket:
+            def __init__(self, msgs):
+                self.messages = msgs
+                self.send = AsyncMock()
+                
+            def __aiter__(self):
+                return self
+                
+            async def __anext__(self):
+                if not self.messages:
+                    raise StopAsyncIteration
+                return self.messages.pop(0)
+        
+        mock_ws = MockWebSocket(messages)
         
         # Handle connection
-        try:
-            await acf_server.handle_websocket(mock_ws, "/")
-        except StopAsyncIteration:
-            pass
+        await acf_server.handle_websocket(mock_ws, "/")
         
         # Verify
         assert "test-agent-flow" in acf_server.connections
 
     async def test_handle_invalid_json(self, acf_server):
         """Test handling invalid JSON"""
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__ = AsyncMock(return_value=iter(["invalid json"]))
+        messages = ["invalid json"]
+        
+        class MockWebSocket:
+            def __init__(self, msgs):
+                self.messages = msgs
+                self.send = AsyncMock()
+                
+            def __aiter__(self):
+                return self
+                
+            async def __anext__(self):
+                if not self.messages:
+                    raise StopAsyncIteration
+                return self.messages.pop(0)
+        
+        mock_ws = MockWebSocket(messages)
         
         # Should not raise exception
         await acf_server.handle_websocket(mock_ws, "/")
     
     async def test_handle_unknown_message_type(self, acf_server):
         """Test handling unknown message type"""
-        mock_ws = AsyncMock()
+        messages = [json.dumps({"type": "UNKNOWN_TYPE", "payload": {}})]
         
-        unknown_msg = {
-            "type": "UNKNOWN_TYPE",
-            "payload": {}
-        }
-        mock_ws.__aiter__ = AsyncMock(return_value=iter([json.dumps(unknown_msg)]))
+        class MockWebSocket:
+            def __init__(self, msgs):
+                self.messages = msgs
+                self.send = AsyncMock()
+                
+            def __aiter__(self):
+                return self
+                
+            async def __anext__(self):
+                if not self.messages:
+                    raise StopAsyncIteration
+                return self.messages.pop(0)
+        
+        mock_ws = MockWebSocket(messages)
         
         # Should not raise exception
         await acf_server.handle_websocket(mock_ws, "/")
