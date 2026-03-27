@@ -16,7 +16,6 @@ class ACFServer:
         self.host = host
         self.port = port
         self.connections = {}  # Map: agent_id -> websocket
-        self.arf_ws = None  # ARF WebSocket connection
         
     async def handle_websocket(self, websocket, path):
         """Handle WebSocket connections"""
@@ -122,9 +121,9 @@ class ACFServer:
         
         db.close()
         
-        # Forward to ARF
-        if self.arf_ws:
-            await self.arf_ws.send(json.dumps(data))
+        # Forward to ARF (ARF connects as a client to ACF)
+        if "ARF" in self.connections:
+            await self.connections["ARF"].send(json.dumps(data))
             print(f"ACF: Forwarded TASK_ACCEPT_COLLABORATION to ARF")
         
         # Forward to destination if not ARF
@@ -142,36 +141,12 @@ class ACFServer:
         else:
             print(f"ACF: Destination agent {dst_agent_id} not connected")
     
-    async def connect_to_arf(self):
-        """Connect to ARF as a client"""
-        try:
-            self.arf_ws = await websockets.connect('ws://localhost:9001/ws')
-            
-            # Send SETUP message
-            setup_msg = {
-                "type": "SETUP",
-                "timestamp": datetime.utcnow().isoformat() + 'Z',
-                "payload": {
-                    "src_agent_id": "ACF"
-                }
-            }
-            await self.arf_ws.send(json.dumps(setup_msg))
-            
-            # Wait for response
-            response = await self.arf_ws.recv()
-            print(f"ACF: Connected to ARF, response: {response}")
-            
-        except Exception as e:
-            print(f"ACF: Failed to connect to ARF: {e}")
-    
     async def start(self):
-        """Start the WebSocket server"""
-        # First connect to ARF
-        await self.connect_to_arf()
-        
-        # Start WebSocket server
+        """Start the WebSocket server - ARF will connect to us as a client"""
+        # Start WebSocket server and wait for ARF to connect
         async with websockets.serve(self.handle_websocket, self.host, self.port):
             print(f"ACF WebSocket Server started on ws://{self.host}:{self.port}")
+            print(f"ACF: Waiting for ARF to connect...")
             await asyncio.Future()  # Run forever
 
 if __name__ == '__main__':

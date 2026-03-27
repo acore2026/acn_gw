@@ -10,19 +10,16 @@ import websockets
 import json
 import httpx
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 from models import get_db, Agent, Task
-from typing import List, Dict
+from typing import List
 
 app = FastAPI(title="ARF - Agent Repository Function")
 
-# ACF WebSocket connection (ARF connects to ACF)
+# ACF WebSocket connection (ARF connects to ACF as a client)
 acf_ws = None
-
-# WebSocket connections to ARF (other entities connect to ARF)
-arf_connections: Dict[str, WebSocket] = {}
 
 IDM_URL = "http://10.0.18.210:9020/idm/v1/vc-verifications"
 
@@ -277,46 +274,6 @@ async def connect_to_acf():
         
     except Exception as e:
         print(f"ARF: Failed to connect to ACF: {e}")
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for ACF and other entities to connect to ARF"""
-    await websocket.accept()
-    agent_id = None
-    
-    try:
-        while True:
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            msg_type = data.get('type')
-            
-            if msg_type == 'SETUP':
-                agent_id = data['payload']['src_agent_id']
-                arf_connections[agent_id] = websocket
-                print(f"ARF: {agent_id} connected via WebSocket")
-                
-                # Send SETUP response
-                response = {
-                    "type": "SETUP",
-                    "timestamp": datetime.utcnow().isoformat() + 'Z',
-                    "payload": {
-                        "status": "OK"
-                    }
-                }
-                await websocket.send_text(json.dumps(response))
-            elif msg_type == 'TASK_ACCEPT_COLLABORATION':
-                # Forward to handle_task_accept
-                await handle_task_accept(data)
-            else:
-                print(f"ARF: Unknown WebSocket message type: {msg_type}")
-                
-    except WebSocketDisconnect:
-        print(f"ARF: WebSocket disconnected for {agent_id}")
-    except Exception as e:
-        print(f"ARF: WebSocket error: {e}")
-    finally:
-        if agent_id and agent_id in arf_connections:
-            del arf_connections[agent_id]
 
 async def startup_event():
     """Startup event handler"""
