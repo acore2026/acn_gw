@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from models import get_db, Agent, Task
 from typing import List
+from logger_config import arf_logger
 
 app = FastAPI(title="ARF - Agent Repository Function")
 
@@ -81,7 +82,7 @@ async def register_agent_card(request: Request):
         db.commit()
         db.close()
         
-        print(f"ARF: Agent {agent_id} registered with capabilities: {capabilities}")
+        arf_logger.info(f"Agent {agent_id} registered with capabilities: {capabilities}")
         
         return JSONResponse(
             status_code=200,
@@ -89,7 +90,7 @@ async def register_agent_card(request: Request):
         )
         
     except Exception as e:
-        print(f"ARF: Error registering agent: {e}")
+        arf_logger.info(f"Error registering agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/arf/v1/agent-discoveries")
@@ -103,7 +104,7 @@ async def discover_agents(request: Request):
         task_id = body.get('task_id')
         required_capabilities = body.get('required_capabilities', [])
         
-        print(f"ARF: Discovery request from {requester_agent_id} for task {task_id}")
+        arf_logger.info(f"Discovery request from {requester_agent_id} for task {task_id}")
         
         # Return 200 OK immediately
         response_task = asyncio.create_task(process_discovery(
@@ -116,7 +117,7 @@ async def discover_agents(request: Request):
         )
         
     except Exception as e:
-        print(f"ARF: Error in discovery: {e}")
+        arf_logger.info(f"Error in discovery: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_discovery(requester_agent_id: str, task_id: str, required_capabilities: List[str]):
@@ -136,7 +137,7 @@ async def process_discovery(requester_agent_id: str, task_id: str, required_capa
     ).all()
     
     if not candidates:
-        print(f"ARF: No available agents found for discovery")
+        arf_logger.info(f"No available agents found for discovery")
         db.close()
         return
     
@@ -150,7 +151,7 @@ async def process_discovery(requester_agent_id: str, task_id: str, required_capa
                 scored_agents.append((agent, score))
     
     if not scored_agents:
-        print(f"ARF: No agents with matching capabilities found")
+        arf_logger.info(f"No agents with matching capabilities found")
         db.close()
         return
     
@@ -160,7 +161,7 @@ async def process_discovery(requester_agent_id: str, task_id: str, required_capa
     # Select the best matching agent
     selected_agent = scored_agents[0][0]
     
-    print(f"ARF: Selected agent {selected_agent.agent_id} for collaboration")
+    arf_logger.info(f"Selected agent {selected_agent.agent_id} for collaboration")
     
     # Send TASK_REQUEST_COLLABORATION via ACF
     if acf_ws:
@@ -179,9 +180,9 @@ async def process_discovery(requester_agent_id: str, task_id: str, required_capa
             }
         }
         await acf_ws.send(json.dumps(collab_msg))
-        print(f"ARF: Sent TASK_REQUEST_COLLABORATION to {selected_agent.agent_id}")
+        arf_logger.info(f"Sent TASK_REQUEST_COLLABORATION to {selected_agent.agent_id}")
     else:
-        print(f"ARF: ACF connection not available")
+        arf_logger.info(f"ACF connection not available")
     
     db.close()
 
@@ -198,19 +199,19 @@ async def handle_acf_messages():
                 if msg_type == 'TASK_ACCEPT_COLLABORATION':
                     await handle_task_accept(data)
                 elif msg_type == 'SETUP':
-                    print(f"ARF: Received SETUP response from ACF")
+                    arf_logger.info(f"Received SETUP response from ACF")
                 else:
-                    print(f"ARF: Unknown message from ACF: {msg_type}")
+                    arf_logger.info(f"Unknown message from ACF: {msg_type}")
                     
             except json.JSONDecodeError:
-                print(f"ARF: Invalid JSON from ACF")
+                arf_logger.info(f"Invalid JSON from ACF")
             except Exception as e:
-                print(f"ARF: Error processing ACF message: {e}")
+                arf_logger.info(f"Error processing ACF message: {e}")
                 
     except websockets.exceptions.ConnectionClosed:
-        print(f"ARF: ACF connection closed")
+        arf_logger.info(f"ACF connection closed")
     except Exception as e:
-        print(f"ARF: Error in ACF message handler: {e}")
+        arf_logger.info(f"Error in ACF message handler: {e}")
 
 async def handle_task_accept(data):
     """Handle TASK_ACCEPT_COLLABORATION from ACF"""
@@ -221,7 +222,7 @@ async def handle_task_accept(data):
     dst_agent_id = payload.get('dst_agent_id')
     task_id = payload.get('task_id')
     
-    print(f"ARF: Received TASK_ACCEPT_COLLABORATION from {src_agent_id}")
+    arf_logger.info(f"Received TASK_ACCEPT_COLLABORATION from {src_agent_id}")
     
     # Record in Task table
     db = get_db()
@@ -246,7 +247,7 @@ async def handle_task_accept(data):
             }
         }
         await acf_ws.send(json.dumps(discover_msg))
-        print(f"ARF: Sent DISCOVER_RESULT to {dst_agent_id}")
+        arf_logger.info(f"Sent DISCOVER_RESULT to {dst_agent_id}")
 
 async def connect_to_acf():
     """Connect to ACF WebSocket server"""
@@ -267,13 +268,13 @@ async def connect_to_acf():
         
         # Wait for response
         response = await acf_ws.recv()
-        print(f"ARF: Connected to ACF, response: {response}")
+        arf_logger.info(f"Connected to ACF, response: {response}")
         
         # Start message handler
         asyncio.create_task(handle_acf_messages())
         
     except Exception as e:
-        print(f"ARF: Failed to connect to ACF: {e}")
+        arf_logger.info(f"Failed to connect to ACF: {e}")
 
 async def startup_event():
     """Startup event handler"""

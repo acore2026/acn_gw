@@ -10,6 +10,7 @@ import websockets
 import json
 from datetime import datetime
 from models import get_db, Agent, Task
+from logger_config import acf_logger
 
 class ACFServer:
     def __init__(self, host='0.0.0.0', port=9002):
@@ -36,15 +37,15 @@ class ACFServer:
                     elif msg_type == 'DISCOVER_RESULT':
                         await self.handle_discover_result(data)
                     else:
-                        print(f"ACF: Unknown message type: {msg_type}")
+                        acf_logger.info(f"Unknown message type: {msg_type}")
                         
                 except json.JSONDecodeError:
-                    print(f"ACF: Invalid JSON received")
+                    acf_logger.info(f"Invalid JSON received")
                 except Exception as e:
-                    print(f"ACF: Error processing message: {e}")
+                    acf_logger.info(f"Error processing message: {e}")
                     
         except websockets.exceptions.ConnectionClosed:
-            print(f"ACF: Connection closed for agent {agent_id}")
+            acf_logger.info(f"Connection closed for agent {agent_id}")
         finally:
             if agent_id and agent_id in self.connections:
                 del self.connections[agent_id]
@@ -55,7 +56,7 @@ class ACFServer:
                     agent.agent_status = 'offline'
                     db.commit()
                 db.close()
-                print(f"ACF: Agent {agent_id} disconnected")
+                acf_logger.info(f"Agent {agent_id} disconnected")
     
     async def handle_setup(self, websocket, data):
         """Handle SETUP message from agent"""
@@ -72,7 +73,7 @@ class ACFServer:
             db.commit()
         db.close()
         
-        print(f"ACF: Agent {agent_id} connected and status set to online")
+        acf_logger.info(f"Agent {agent_id} connected and status set to online")
         
         # Send SETUP response
         response = {
@@ -90,9 +91,9 @@ class ACFServer:
         
         if dst_agent_id in self.connections:
             await self.connections[dst_agent_id].send(json.dumps(data))
-            print(f"ACF: Forwarded TASK_REQUEST_COLLABORATION to {dst_agent_id}")
+            acf_logger.info(f"Forwarded TASK_REQUEST_COLLABORATION to {dst_agent_id}")
         else:
-            print(f"ACF: Destination agent {dst_agent_id} not connected")
+            acf_logger.info(f"Destination agent {dst_agent_id} not connected")
     
     async def handle_task_accept_collaboration(self, data):
         """Handle TASK_ACCEPT_COLLABORATION"""
@@ -124,12 +125,12 @@ class ACFServer:
         # Forward to ARF (ARF connects as a client to ACF)
         if "ARF" in self.connections:
             await self.connections["ARF"].send(json.dumps(data))
-            print(f"ACF: Forwarded TASK_ACCEPT_COLLABORATION to ARF")
+            acf_logger.info(f"Forwarded TASK_ACCEPT_COLLABORATION to ARF")
         
         # Forward to destination if not ARF
         if dst_agent_id != 'ARF' and dst_agent_id in self.connections:
             await self.connections[dst_agent_id].send(json.dumps(data))
-            print(f"ACF: Forwarded TASK_ACCEPT_COLLABORATION to {dst_agent_id}")
+            acf_logger.info(f"Forwarded TASK_ACCEPT_COLLABORATION to {dst_agent_id}")
     
     async def handle_discover_result(self, data):
         """Forward DISCOVER_RESULT to destination agent"""
@@ -137,16 +138,16 @@ class ACFServer:
         
         if dst_agent_id in self.connections:
             await self.connections[dst_agent_id].send(json.dumps(data))
-            print(f"ACF: Forwarded DISCOVER_RESULT to {dst_agent_id}")
+            acf_logger.info(f"Forwarded DISCOVER_RESULT to {dst_agent_id}")
         else:
-            print(f"ACF: Destination agent {dst_agent_id} not connected")
+            acf_logger.info(f"Destination agent {dst_agent_id} not connected")
     
     async def start(self):
         """Start the WebSocket server - ARF will connect to us as a client"""
         # Start WebSocket server and wait for ARF to connect
         async with websockets.serve(self.handle_websocket, self.host, self.port):
-            print(f"ACF WebSocket Server started on ws://{self.host}:{self.port}")
-            print(f"ACF: Waiting for ARF to connect...")
+            acf_logger.info(f"ACF WebSocket Server started on ws://{self.host}:{self.port}")
+            acf_logger.info(f"Waiting for ARF to connect...")
             await asyncio.Future()  # Run forever
 
 if __name__ == '__main__':

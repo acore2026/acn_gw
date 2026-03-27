@@ -51,6 +51,7 @@ htmlcov/
 # Logs
 *.log
 logs/
+*.log.*
 
 # Certificates (self-signed)
 *.pem

@@ -7,7 +7,6 @@ Compatible with moq/moq/moq implementation
 
 import asyncio
 import json
-import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple, Callable, Any
 from dataclasses import dataclass, field
@@ -19,8 +18,7 @@ from moqt.messages import (
     ObjectDatagram, ObjectHeader
 )
 from moqt.transport import QUICServer, is_quic_available, StreamData, DatagramData
-
-logger = logging.getLogger(__name__)
+from logger_config import moqt_logger as logger
 
 
 @dataclass
