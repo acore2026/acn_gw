@@ -208,7 +208,7 @@ async def handle_acf_messages():
             except Exception as e:
                 arf_logger.info(f"Error processing ACF message: {e}")
                 
-    except websockets.exceptions.ConnectionClosed:
+    except websockets.ConnectionClosed:
         arf_logger.info(f"ACF connection closed")
     except Exception as e:
         arf_logger.info(f"Error in ACF message handler: {e}")

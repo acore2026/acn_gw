@@ -36,6 +36,8 @@ class ACFServer:
                         await self.handle_task_accept_collaboration(data)
                     elif msg_type == 'DISCOVER_RESULT':
                         await self.handle_discover_result(data)
+                    elif msg_type == 'ROUTE':
+                        await self.handle_route(data)
                     else:
                         acf_logger.info(f"Unknown message type: {msg_type}")
                         
@@ -44,7 +46,7 @@ class ACFServer:
                 except Exception as e:
                     acf_logger.info(f"Error processing message: {e}")
                     
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.ConnectionClosed:
             acf_logger.info(f"Connection closed for agent {agent_id}")
         finally:
             if agent_id and agent_id in self.connections:
@@ -141,6 +143,16 @@ class ACFServer:
             acf_logger.info(f"Forwarded DISCOVER_RESULT to {dst_agent_id}")
         else:
             acf_logger.info(f"Destination agent {dst_agent_id} not connected")
+    
+    async def handle_route(self, data):
+        """Forward ROUTE message to destination agent as-is"""
+        dst_agent_id = data['payload']['dst_agent_id']
+        
+        if dst_agent_id in self.connections:
+            await self.connections[dst_agent_id].send(json.dumps(data))
+            acf_logger.info(f"Forwarded ROUTE message to {dst_agent_id}")
+        else:
+            acf_logger.info(f"Destination agent {dst_agent_id} not connected for ROUTE message")
     
     async def start(self):
         """Start the WebSocket server - ARF will connect to us as a client"""

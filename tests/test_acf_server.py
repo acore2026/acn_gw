@@ -263,22 +263,41 @@ class TestACFWebSocketHandler:
             def __init__(self, msgs):
                 self.messages = msgs
                 self.send = AsyncMock()
+                self._closed = False
                 
             def __aiter__(self):
                 return self
                 
             async def __anext__(self):
                 if not self.messages:
+                    # Keep connection open by sleeping instead of raising StopAsyncIteration
+                    # This simulates a real WebSocket that waits for more messages
+                    while not self._closed:
+                        await asyncio.sleep(0.1)
                     raise StopAsyncIteration
                 return self.messages.pop(0)
+            
+            async def close(self):
+                self._closed = True
         
         mock_ws = MockWebSocket(messages)
         
-        # Handle connection
-        await acf_server.handle_websocket(mock_ws, "/")
+        # Handle connection in a task so we can cancel it
+        task = asyncio.create_task(acf_server.handle_websocket(mock_ws, "/"))
         
-        # Verify
+        # Give handler time to process the SETUP message
+        await asyncio.sleep(0.2)
+        
+        # Verify agent is connected
         assert "test-agent-flow" in acf_server.connections
+        
+        # Close the mock to end the handler
+        await mock_ws.close()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def test_handle_invalid_json(self, acf_server):
         """Test handling invalid JSON"""

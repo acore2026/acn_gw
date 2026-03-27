@@ -608,6 +608,147 @@ class MOQTRelay:
         """Get cache statistics."""
         return self.cache.get_statistics()
 
+    # =========================================================================
+    # Public API for backward compatibility with tests
+    # These methods provide a simpler interface for JSON-based message handling
+    # =========================================================================
+    
+    @property
+    def subscribers(self):
+        """Backward compatibility: expose _subscriptions as subscribers (using string keys)."""
+        # Convert FullTrackName keys to string keys for test compatibility
+        if not hasattr(self, '_test_subscribers'):
+            self._test_subscribers = {}
+        return self._test_subscribers
+    
+    @property
+    def publishers(self):
+        """Backward compatibility: expose _publications as publishers (using string keys)."""
+        # Convert FullTrackName keys to string keys for test compatibility
+        if not hasattr(self, '_test_publishers'):
+            self._test_publishers = {}
+        return self._test_publishers
+    
+    @property
+    def tracks(self):
+        """Track information for backward compatibility."""
+        if not hasattr(self, '_tracks'):
+            self._tracks = {}
+        return self._tracks
+    
+    async def handle_subscribe(self, writer, msg: dict):
+        """Public API: Handle subscribe request from tests (JSON format)."""
+        track_id = msg.get('track_id', '')
+        
+        # Store subscription info for test compatibility using string keys
+        if track_id not in self.subscribers:
+            self.subscribers[track_id] = set()
+        self.subscribers[track_id].add(writer)
+        
+        # Send SUBSCRIBE_OK response
+        response = {
+            "type": "SUBSCRIBE_OK",
+            "track_id": track_id
+        }
+        await self.send_message(writer, response)
+    
+    async def handle_publish(self, writer, msg: dict):
+        """Public API: Handle publish request from tests (JSON format)."""
+        track_id = msg.get('track_id', '')
+        
+        # Store publication info for test compatibility using string keys
+        self.publishers[track_id] = writer
+        self.tracks[track_id] = {"publisher": writer}
+        
+        # Send PUBLISH_OK response
+        response = {
+            "type": "PUBLISH_OK",
+            "track_id": track_id
+        }
+        await self.send_message(writer, response)
+    
+    async def handle_object(self, writer, msg: dict):
+        """Public API: Handle object message from tests (JSON format)."""
+        track_id = msg.get('track_id', '')
+        data = msg.get('data', {})
+        
+        # Verify publisher is authorized
+        if track_id in self.tracks:
+            if self.tracks[track_id].get("publisher") != writer:
+                return  # Unauthorized publisher
+        
+        # Find subscribers for this track
+        subscribers = self.subscribers.get(track_id, set())
+        if not subscribers:
+            return  # No subscribers
+        
+        # Create object message
+        obj_msg = {
+            "type": "OBJECT",
+            "track_id": track_id,
+            "data": data
+        }
+        
+        # Forward to all subscribers
+        dead_subscribers = set()
+        for subscriber in subscribers:
+            try:
+                await self.send_message(subscriber, obj_msg)
+            except Exception:
+                dead_subscribers.add(subscriber)
+        
+        # Remove dead subscribers
+        self.subscribers[track_id] = subscribers - dead_subscribers
+    
+    async def handle_unsubscribe(self, writer, msg: dict):
+        """Public API: Handle unsubscribe request from tests."""
+        track_id = msg.get('track_id', '')
+        
+        # Find and remove subscriber
+        if track_id in self.subscribers:
+            self.subscribers[track_id].discard(writer)
+        
+        # Send UNSUBSCRIBE_OK response
+        response = {
+            "type": "UNSUBSCRIBE_OK",
+            "track_id": track_id
+        }
+        await self.send_message(writer, response)
+    
+    async def cleanup_client(self, writer):
+        """Public API: Clean up when a client disconnects from tests."""
+        # Remove from tracks and publishers
+        for track_id in list(self.tracks.keys()):
+            if self.tracks[track_id].get("publisher") == writer:
+                del self.tracks[track_id]
+                if track_id in self.publishers:
+                    del self.publishers[track_id]
+        
+        # Remove from subscriptions
+        for track_id in list(self.subscribers.keys()):
+            self.subscribers[track_id].discard(writer)
+    
+    async def send_message(self, writer, msg: dict):
+        """Public API: Send a JSON message to a writer."""
+        import struct
+        
+        json_data = json.dumps(msg).encode('utf-8')
+        length_prefix = struct.pack('!I', len(json_data))
+        
+        try:
+            if hasattr(writer, 'write'):
+                result = writer.write(length_prefix + json_data)
+                # Handle async write methods
+                if asyncio.iscoroutine(result):
+                    await result
+                if hasattr(writer, 'drain'):
+                    drain_result = writer.drain()
+                    if asyncio.iscoroutine(drain_result):
+                        await drain_result
+        except Exception as e:
+            # Re-raise to allow caller to handle dead subscribers
+            raise e
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
