@@ -1,4 +1,4 @@
-.PHONY: help setup install clean test run lint venv
+.PHONY: help setup install clean test run run-arf run-acf run-moqt stop lint venv
 
 # Default Python interpreter
 PYTHON := python3
@@ -19,6 +19,7 @@ help:
 	@echo "  make run-arf     - Start ARF server only (port 9001)"
 	@echo "  make run-acf     - Start ACF server only (port 9002)"
 	@echo "  make run-moqt    - Start MOQT Relay only (port 9003)"
+	@echo "  make stop        - Stop all running services"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test        - Run all tests"
@@ -65,6 +66,14 @@ run-acf: venv
 run-moqt: venv
 	@echo "Starting MOQT Relay on port 9003..."
 	@$(VENV_BIN)/python moqt_relay.py
+
+stop:
+	@echo "Stopping all Agent GW services..."
+	@pkill -f "python main.py" 2>/dev/null || true
+	@pkill -f "uvicorn arf_server:app" 2>/dev/null || true
+	@pkill -f "python acf_server.py" 2>/dev/null || true
+	@pkill -f "python moqt_relay.py" 2>/dev/null || true
+	@echo "Services stopped"
 
 # Testing commands
 test: venv
