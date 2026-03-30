@@ -1,756 +1,347 @@
 #!/usr/bin/env python3
 """
-MOQT Relay Server for Agent GW
-Full MOQT implementation using QUIC transport
-Compatible with moq/moq/moq implementation
+MOQT Relay - 使用moq-py实现
+保持与原有API完全兼容
 """
 
+import sys
 import asyncio
 import json
+import struct
+import logging
+from pathlib import Path
+from typing import Optional, Dict, Set, Any
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple, Callable, Any
-from dataclasses import dataclass, field
 
-from moqt.encoding import FullTrackName, Location
-from moqt.messages import (
-    SubscribeMessage, SubscribeOkMessage, PublishMessage, PublishOkMessage,
-    FetchMessage, FetchOkMessage, decode_control_message, GroupOrder, ErrorCode,
-    ObjectDatagram, ObjectHeader
-)
-from moqt.transport import QUICServer, is_quic_available, StreamData, DatagramData
-from logger_config import moqt_logger as logger
+# 添加moq-py到路径
+moq_py_path = Path(__file__).parent / 'moq-py'
+if str(moq_py_path) not in sys.path:
+    sys.path.insert(0, str(moq_py_path))
+
+from moq import MOQRelay as MOQPyRelay
+from moq.encoding import FullTrackName, Location
+from logger_config import moqt_logger as logger, LOG_DIR
 
 
-@dataclass
-class ClientSession:
-    """Represents a connected client session over QUIC."""
-    session_id: str
-    protocol: Any  # MOQQuicProtocol instance
-    quic_connection: Any  # QuicConnection instance
-    role: Optional[str] = None
-    subscriptions: Dict[FullTrackName, dict] = field(default_factory=dict)
-    publications: Dict[FullTrackName, dict] = field(default_factory=dict)
-    control_stream_id: Optional[int] = None
-    control_buffer: bytes = b""
+def setup_moq_py_logging():
+    """
+    配置moq-py的日志输出到文件
+    将所有MOQT相关日志统一保存到 logs/moqt.log
+    """
+    # 创建文件处理器
+    moq_file_handler = logging.FileHandler(LOG_DIR / 'moqt.log', mode='a')
+    moq_file_handler.setLevel(logging.INFO)
+    moq_file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    
+    # 为moq-py的所有logger添加处理器
+    moq_py_loggers = [
+        'moq.relay',
+        'moq.relay.relay',
+        'moq.transport',
+        'moq.transport.quic_transport',
+        'moq.session',
+        'moq.session.session',
+        'moq.pub',
+        'moq.pub.publisher',
+        'moq.sub',
+        'moq.sub.subscriber'
+    ]
+    
+    for logger_name in moq_py_loggers:
+        moq_logger = logging.getLogger(logger_name)
+        # 避免重复添加处理器
+        if not any(isinstance(h, logging.FileHandler) and 
+                   getattr(h, 'baseFilename', '') == str(LOG_DIR / 'moqt.log')
+                   for h in moq_logger.handlers):
+            moq_logger.addHandler(moq_file_handler)
+        moq_logger.setLevel(logging.INFO)
+    
+    logger.info(f"Configured moq-py logging to {LOG_DIR / 'moqt.log'}")
 
 
-@dataclass
-class CachedObject:
-    """Cached object with metadata."""
-    track_alias: int
-    group_id: int
-    object_id: int
-    publisher_priority: int
-    payload: bytes
-    timestamp: datetime = field(default_factory=datetime.now)
-    access_count: int = 0
-    
-    def to_bytes(self) -> bytes:
-        """Serialize to bytes."""
-        header = ObjectHeader(
-            track_alias=self.track_alias,
-            group_id=self.group_id,
-            object_id=self.object_id,
-            publisher_priority=self.publisher_priority
-        )
-        datagram = ObjectDatagram(header=header, payload=self.payload)
-        return datagram.encode()
-    
-    @staticmethod
-    def from_bytes(data: bytes) -> 'CachedObject':
-        """Deserialize from bytes."""
-        datagram, _ = ObjectDatagram.decode(data)
-        return CachedObject(
-            track_alias=datagram.header.track_alias,
-            group_id=datagram.header.group_id,
-            object_id=datagram.header.object_id,
-            publisher_priority=datagram.header.publisher_priority,
-            payload=datagram.payload
-        )
-    
-    def get_location(self) -> Location:
-        """Get object location."""
-        return Location(self.group_id, self.object_id)
+# 初始化moq-py日志配置
+setup_moq_py_logging()
 
 
-class ObjectCache:
-    """Cache for MOQT objects with memory backing."""
+class MockWriter:
+    """
+    模拟asyncio.StreamWriter，用于兼容测试API
+    """
+    def __init__(self, session_id: str = None):
+        self.session_id = session_id or f"mock_{id(self)}"
+        self._closed = False
+        self._buffer = b""
     
-    def __init__(self, max_memory_size: int = 100 * 1024 * 1024):  # 100MB default
-        self.max_memory_size = max_memory_size
-        
-        # Memory cache: track_name -> {location -> CachedObject}
-        self._memory_cache: Dict[FullTrackName, Dict[Location, CachedObject]] = {}
-        self._memory_size = 0
-        
-        # Statistics
-        self._hits = 0
-        self._misses = 0
+    def write(self, data: bytes):
+        if not self._closed:
+            self._buffer += data
     
-    def put(self, track_name: FullTrackName, obj: CachedObject):
-        """Add object to cache."""
-        location = obj.get_location()
-        
-        # Add to memory cache
-        if track_name not in self._memory_cache:
-            self._memory_cache[track_name] = {}
-        
-        # Remove old object if exists
-        if location in self._memory_cache[track_name]:
-            old_obj = self._memory_cache[track_name][location]
-            self._memory_size -= len(old_obj.payload)
-        
-        # Add new object
-        self._memory_cache[track_name][location] = obj
-        self._memory_size += len(obj.payload)
-        
-        # Evict from memory if needed
-        self._evict_memory_if_needed()
+    async def drain(self):
+        pass
     
-    def _evict_memory_if_needed(self):
-        """Evict objects from memory cache if size exceeds limit."""
-        if self._memory_size <= self.max_memory_size:
-            return
-        
-        # Simple LRU eviction
-        all_objects = []
-        for track_name, objects in self._memory_cache.items():
-            for location, obj in objects.items():
-                all_objects.append((track_name, location, obj))
-        
-        # Sort by access time (oldest first)
-        all_objects.sort(key=lambda x: x[2].timestamp)
-        
-        # Evict oldest objects
-        while self._memory_size > self.max_memory_size * 0.8 and all_objects:
-            track_name, location, obj = all_objects.pop(0)
-            if location in self._memory_cache.get(track_name, {}):
-                del self._memory_cache[track_name][location]
-                self._memory_size -= len(obj.payload)
-                logger.debug(f"Evicted from memory: {track_name} @ {location}")
+    def close(self):
+        self._closed = True
     
-    def get(self, track_name: FullTrackName, location: Location) -> Optional[CachedObject]:
-        """Get object from cache."""
-        # Try memory cache
-        if track_name in self._memory_cache:
-            if location in self._memory_cache[track_name]:
-                obj = self._memory_cache[track_name][location]
-                obj.access_count += 1
-                obj.timestamp = datetime.now()
-                self._hits += 1
-                return obj
-        
-        self._misses += 1
-        return None
+    async def wait_closed(self):
+        pass
     
-    def get_range(self, track_name: FullTrackName, 
-                  start: Location, end: Location) -> List[CachedObject]:
-        """Get all objects in range from cache."""
-        objects = []
-        
-        if track_name not in self._memory_cache:
-            return objects
-        
-        for location, obj in self._memory_cache[track_name].items():
-            if start <= location <= end:
-                obj.access_count += 1
-                objects.append(obj)
-        
-        # Sort by location
-        objects.sort(key=lambda o: o.get_location())
-        return objects
-    
-    def get_statistics(self) -> dict:
-        """Get cache statistics."""
-        total_requests = self._hits + self._misses
-        hit_rate = self._hits / total_requests if total_requests > 0 else 0
-        
-        return {
-            'memory_size': self._memory_size,
-            'memory_objects': sum(len(objs) for objs in self._memory_cache.values()),
-            'hits': self._hits,
-            'misses': self._misses,
-            'hit_rate': hit_rate
-        }
+    def is_closing(self):
+        return self._closed
 
 
 class MOQTRelay:
     """
-    MOQT Relay Server for Agent GW
-    Full MOQT implementation using QUIC transport
-    Port: 9003
+    MOQT Relay - 使用moq-py实现，保持API兼容
     """
     
     def __init__(self, host: str = '0.0.0.0', port: int = 9003,
                  cert_file: Optional[str] = None,
-                 key_file: Optional[str] = None):
+                 key_file: Optional[str] = None,
+                 cache_dir: Optional[str] = None):
+        """
+        初始化Relay
         
-        # Check QUIC availability
-        if not is_quic_available():
-            raise RuntimeError("QUIC is not available. Please install aioquic.")
-        
+        参数与原始实现保持一致，新增cache_dir参数
+        """
         self.host = host
         self.port = port
+        self.cert_file = cert_file
+        self.key_file = key_file
         
-        # Cache
-        self.cache = ObjectCache()
+        # 默认缓存目录
+        if cache_dir is None:
+            cache_dir = str(Path(__file__).parent / '.relay_cache')
         
-        # Client management
-        self._clients: Dict[str, ClientSession] = {}
-        self._publications: Dict[FullTrackName, ClientSession] = {}
-        self._subscriptions: Dict[FullTrackName, List[ClientSession]] = {}
-        self._object_cache: Dict[FullTrackName, List[dict]] = {}
-        self._max_cached_objects = 1000  # Limit cache size
-        self._running = False
-        
-        # QUIC Server
-        self._quic_server = QUICServer(
+        # 创建moq-py的MOQRelay实例
+        self._relay = MOQPyRelay(
             host=host,
             port=port,
-            use_datagrams=True,
+            cache_dir=cache_dir,
+            max_memory_cache=100 * 1024 * 1024,      # 100MB
+            max_disk_cache=1024 * 1024 * 1024,       # 1GB
             cert_file=cert_file,
             key_file=key_file
         )
         
-        logger.info(f"MOQTRelay initialized: {host}:{port} (QUIC)")
+        # 兼容层数据结构
+        self._subscribers: Dict[str, Set[MockWriter]] = {}
+        self._publishers: Dict[str, MockWriter] = {}
+        self._tracks: Dict[str, dict] = {}
+        
+        logger.info(f"MOQTRelay initialized: {host}:{port}")
     
     async def start(self):
-        """Start the relay server using QUIC transport."""
-        self._running = True
-        
-        # Set up QUIC server handlers
-        self._quic_server.set_handlers(
-            on_client_connect=self._on_quic_client_connect,
-            on_stream_data=self._on_quic_stream_data,
-            on_datagram=self._on_quic_datagram,
-            on_client_disconnect=self._on_quic_client_disconnect
-        )
-        
-        # Start QUIC server
-        await self._quic_server.start()
-        
-        logger.info(f"MOQ Relay running on {self.host}:{self.port} (QUIC)")
-        logger.info("Waiting for connections... (Press Ctrl+C to stop)")
+        """启动Relay"""
+        logger.info(f"Starting MOQT Relay on {self.host}:{self.port}")
+        await self._relay.start()
+        logger.info("MOQT Relay started successfully")
     
     async def stop(self):
-        """Stop the relay server."""
-        self._running = False
-        
-        # Stop the QUIC server
-        if self._quic_server:
-            await self._quic_server.stop()
-        
-        # Close all client connections
-        for client in list(self._clients.values()):
-            try:
-                if hasattr(client.protocol, 'close'):
-                    client.protocol.close()
-            except:
-                pass
-        self._clients.clear()
-        
-        logger.info("Relay server stopped")
+        """停止Relay"""
+        logger.info("Stopping MOQT Relay...")
+        await self._relay.stop()
+        logger.info("MOQT Relay stopped")
     
-    async def _on_quic_client_connect(self, protocol):
-        """Handle new QUIC client connection."""
-        client = self._get_or_create_client(protocol)
-        logger.info(f"QUIC client connected: {client.session_id}")
-    
-    async def _on_quic_client_disconnect(self, protocol, error_code, reason):
-        """Handle QUIC client disconnection."""
-        # Find client by protocol
-        for session_id, client in list(self._clients.items()):
-            if client.protocol == protocol:
-                await self._cleanup_client(client)
-                break
-        
-        logger.info(f"QUIC client disconnected: error_code={error_code}, reason={reason}")
-    
-    async def _on_quic_stream_data(self, protocol, stream_data: StreamData):
-        """Handle data received on a QUIC stream."""
-        client = self._get_or_create_client(protocol)
-        
-        # Set control stream if not set
-        if client.control_stream_id is None:
-            client.control_stream_id = stream_data.stream_id
-        
-        if stream_data.stream_id == client.control_stream_id:
-            await self._handle_control_stream_data(client, stream_data.data, end_stream=stream_data.end_stream)
-        else:
-            await self._handle_message(client, stream_data.data)
-    
-    async def _on_quic_datagram(self, protocol, datagram_data: DatagramData):
-        """Handle data received as QUIC datagram."""
-        client = self._get_or_create_client(protocol)
-        await self._handle_message(client, datagram_data.data)
-    
-    async def _handle_message(self, client: ClientSession, data: bytes):
-        """Handle a message from a client."""
-        try:
-            # Try to decode as control message first
-            try:
-                msg, _ = decode_control_message(data)
-                
-                if isinstance(msg, PublishMessage):
-                    await self._handle_publish(client, msg)
-                elif isinstance(msg, SubscribeMessage):
-                    await self._handle_subscribe(client, msg)
-                elif isinstance(msg, FetchMessage):
-                    await self._handle_fetch(client, msg)
-                else:
-                    logger.debug(f"Received control message type: {type(msg).__name__}")
-                return
-            except Exception as e:
-                logger.debug(f"Not a control message: {e}")
-                pass  # Not a control message, try data message
-            
-            # Try to decode as ObjectDatagram (data message)
-            try:
-                obj, _ = ObjectDatagram.decode(data)
-                await self._handle_object(client, obj)
-                return
-            except Exception as e:
-                logger.debug(f"Not an ObjectDatagram: {e}")
-                pass  # Not an ObjectDatagram either
-            
-            # Treat as raw data
-            logger.debug(f"Received raw data: {len(data)} bytes")
-                
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
-
-    async def _handle_control_stream_data(self, client: ClientSession, data: bytes, end_stream: bool = False):
-        """Handle buffered control stream data from a client."""
-        client.control_buffer += data
-
-        while client.control_buffer:
-            try:
-                msg, consumed = decode_control_message(client.control_buffer)
-            except Exception as e:
-                if end_stream:
-                    logger.warning(f"Failed to decode control message from {client.session_id}: {e}")
-                    client.control_buffer = b""
-                break
-
-            client.control_buffer = client.control_buffer[consumed:]
-            await self._dispatch_control_message(client, msg)
-
-    async def _dispatch_control_message(self, client: ClientSession, msg: object):
-        """Dispatch a decoded control message."""
-        if isinstance(msg, PublishMessage):
-            await self._handle_publish(client, msg)
-        elif isinstance(msg, SubscribeMessage):
-            await self._handle_subscribe(client, msg)
-        elif isinstance(msg, FetchMessage):
-            await self._handle_fetch(client, msg)
-        else:
-            logger.debug(f"Received control message type: {type(msg).__name__}")
-
-    def _get_or_create_client(self, protocol) -> ClientSession:
-        """Find the client session for a protocol, creating it if needed."""
-        for client in self._clients.values():
-            if client.protocol == protocol:
-                return client
-
-        session_id = f"{protocol._quic.host_cid}"
-        client = ClientSession(
-            session_id=session_id,
-            protocol=protocol,
-            quic_connection=protocol._quic
-        )
-        self._clients[session_id] = client
-        logger.info(f"QUIC client registered: {session_id}")
-        return client
-    
-    async def _handle_publish(self, client: ClientSession, msg: PublishMessage):
-        """Handle a publish request."""
-        track_name = msg.full_track_name
-        logger.info(f"Client {client.session_id} publishing: {track_name}")
-        
-        # Store publication
-        self._publications[track_name] = client
-        client.publications[track_name] = {
-            'track_alias': msg.track_alias,
-            'request_id': msg.request_id
-        }
-        
-        # Send PUBLISH_OK
-        response = PublishOkMessage(request_id=msg.request_id)
-        response_data = response.encode()
-        logger.debug(f"Sending PUBLISH_OK: {len(response_data)} bytes")
-        await self._send_control_message(client, response_data)
-        logger.info(f"Publication accepted: {track_name}")
-    
-    async def _handle_subscribe(self, client: ClientSession, msg: SubscribeMessage):
-        """Handle a subscribe request."""
-        track_name = msg.full_track_name
-        logger.info(f"Client {client.session_id} subscribing to: {track_name}")
-        
-        # Store subscription
-        if track_name not in self._subscriptions:
-            self._subscriptions[track_name] = []
-        self._subscriptions[track_name].append(client)
-        client.subscriptions[track_name] = {
-            'track_alias': msg.track_alias,
-            'request_id': msg.request_id
-        }
-        
-        # Send SUBSCRIBE_OK
-        response = SubscribeOkMessage(
-            request_id=msg.request_id,
-            expires=0,
-            group_order=GroupOrder.ASCENDING
-        )
-        response_data = response.encode()
-        logger.debug(f"Sending SUBSCRIBE_OK: {len(response_data)} bytes")
-        await self._send_control_message(client, response_data)
-        logger.info(f"Subscription accepted: {track_name}")
-    
-    async def _handle_fetch(self, client: ClientSession, msg: FetchMessage):
-        """Handle a fetch request."""
-        track_name = msg.full_track_name
-        logger.info(f"Client {client.session_id} fetching from: {track_name}")
-        
-        # Check if track exists (has a publisher or cached objects)
-        has_cached_objects = track_name in self._object_cache and len(self._object_cache[track_name]) > 0
-        if track_name not in self._publications and not has_cached_objects:
-            from moqt.messages.control import RequestErrorMessage, ErrorCode
-            logger.warning(f"Fetch requested for unknown track: {track_name}")
-            response = RequestErrorMessage(
-                request_id=msg.request_id,
-                error_code=ErrorCode.INTERNAL_ERROR,
-                reason="Track not found"
-            )
-            await self._send_control_message(client, response.encode())
-            return
-        
-        # Store fetch request
-        if track_name not in self._subscriptions:
-            self._subscriptions[track_name] = []
-        self._subscriptions[track_name].append(client)
-        
-        # Send FETCH_OK
-        response = FetchOkMessage(
-            request_id=msg.request_id,
-            group_order=GroupOrder.ASCENDING,
-            end_of_track=False
-        )
-        response_data = response.encode()
-        logger.debug(f"Sending FETCH_OK: {len(response_data)} bytes")
-        await self._send_control_message(client, response_data)
-        if track_name in self._publications:
-            logger.info(f"Fetch accepted: {track_name}")
-        else:
-            logger.info(f"Fetch accepted from cache: {track_name}")
-        
-        # Send cached objects that match the fetch range
-        await self._send_cached_objects(client, track_name, msg)
-    
-    async def _send_cached_objects(self, client: ClientSession, track_name: FullTrackName, msg: FetchMessage):
-        """Send cached objects that match the fetch range to the client."""
-        cached_objects = self._object_cache.get(track_name, [])
-        if not cached_objects:
-            logger.info(f"No cached objects for track: {track_name}")
-            return
-        
-        sent_count = 0
-        for obj_data in cached_objects:
-            # Check if object is within fetch range
-            end_group_limit = msg.end_group if msg.end_group is not None else float('inf')
-            end_object_limit = msg.end_object if msg.end_object is not None else float('inf')
-            
-            if (msg.start_group <= obj_data['group_id'] <= end_group_limit and
-                msg.start_object <= obj_data['object_id'] <= end_object_limit):
-                
-                # Create ObjectDatagram and send
-                header = ObjectHeader(
-                    track_alias=obj_data['track_alias'],
-                    group_id=obj_data['group_id'],
-                    object_id=obj_data['object_id'],
-                    publisher_priority=obj_data['publisher_priority'],
-                    object_status=obj_data['object_status']
-                )
-                obj = ObjectDatagram(header=header, payload=obj_data['payload'])
-                
-                try:
-                    await self._send_datagram(client, obj.encode())
-                    sent_count += 1
-                except Exception as e:
-                    logger.error(f"Error sending cached object to {client.session_id}: {e}")
-        
-        logger.info(f"Sent {sent_count} cached objects to {client.session_id} for fetch request")
-    
-    async def _handle_object(self, client: ClientSession, obj: ObjectDatagram):
-        """Handle an object from a publisher."""
-        # Find the track name from the client's publications
-        track_name = None
-        for tn, pub_info in client.publications.items():
-            if pub_info['track_alias'] == obj.header.track_alias:
-                track_name = tn
-                break
-        
-        if not track_name:
-            logger.warning(f"Received object for unknown track alias: {obj.header.track_alias}")
-            return
-        
-        # Cache the object for future fetches
-        await self._cache_object(track_name, obj)
-        
-        # Also cache in the ObjectCache for advanced caching features
-        cached_obj = CachedObject(
-            track_alias=obj.header.track_alias,
-            group_id=obj.header.group_id,
-            object_id=obj.header.object_id,
-            publisher_priority=obj.header.publisher_priority,
-            payload=obj.payload
-        )
-        self.cache.put(track_name, cached_obj)
-        
-        # Forward to all subscribers
-        await self._forward_object(track_name, obj)
-    
-    async def _cache_object(self, track_name: FullTrackName, obj: ObjectDatagram):
-        """Cache an object for future fetch requests."""
-        if track_name not in self._object_cache:
-            self._object_cache[track_name] = []
-        
-        # Store object data
-        self._object_cache[track_name].append({
-            'track_alias': obj.header.track_alias,
-            'group_id': obj.header.group_id,
-            'object_id': obj.header.object_id,
-            'publisher_priority': obj.header.publisher_priority,
-            'object_status': obj.header.object_status,
-            'payload': obj.payload
-        })
-        
-        # Limit cache size
-        if len(self._object_cache[track_name]) > self._max_cached_objects:
-            self._object_cache[track_name].pop(0)
-        
-        logger.debug(f"Cached object for {track_name}: group={obj.header.group_id}, object={obj.header.object_id}")
-    
-    async def _forward_object(self, track_name: FullTrackName, obj: ObjectDatagram):
-        """Forward an object to all subscribers of a track."""
-        subscribers = self._subscriptions.get(track_name, [])
-        if not subscribers:
-            return
-
-        data = obj.encode()
-        forwarded = 0
-
-        for subscriber in subscribers:
-            try:
-                await self._send_datagram(subscriber, data)
-                forwarded += 1
-            except Exception as e:
-                logger.error(f"Error forwarding to {subscriber.session_id}: {e}")
-        
-        if forwarded > 0:
-            logger.debug(f"Forwarded object to {forwarded} subscribers")
-    
-    async def _send_control_message(self, client: ClientSession, data: bytes):
-        """Send a message to a client over QUIC."""
-        try:
-            if client.control_stream_id is not None:
-                # Send on control stream
-                client.quic_connection.send_stream_data(client.control_stream_id, data)
-            else:
-                # Open a new stream or use datagram
-                stream_id = client.quic_connection.get_next_available_stream_id(is_unidirectional=False)
-                client.quic_connection.send_stream_data(stream_id, data)
-            
-            # Transmit the data
-            if hasattr(client.protocol, 'transmit'):
-                client.protocol.transmit()
-            
-            logger.debug(f"Sent {len(data)} bytes to {client.session_id}")
-        except Exception as e:
-            logger.error(f"Error sending message to {client.session_id}: {e}")
-            raise
-
-    async def _send_datagram(self, client: ClientSession, data: bytes):
-        """Send a datagram to a client over QUIC."""
-        try:
-            client.quic_connection.send_datagram_frame(data)
-            if hasattr(client.protocol, 'transmit'):
-                client.protocol.transmit()
-            logger.debug(f"Sent datagram {len(data)} bytes to {client.session_id}")
-        except Exception as e:
-            logger.error(f"Error sending datagram to {client.session_id}: {e}")
-            raise
-    
-    async def _cleanup_client(self, client: ClientSession):
-        """Clean up when a client disconnects."""
-        logger.info(f"Client disconnected: {client.session_id}")
-        
-        # Remove from clients
-        if client.session_id in self._clients:
-            del self._clients[client.session_id]
-        
-        # Remove publications
-        for track_name in list(client.publications.keys()):
-            if track_name in self._publications and self._publications[track_name].session_id == client.session_id:
-                del self._publications[track_name]
-                logger.info(f"Publication removed: {track_name}")
-        
-        # Remove subscriptions
-        for track_name in list(client.subscriptions.keys()):
-            if track_name in self._subscriptions:
-                self._subscriptions[track_name] = [
-                    s for s in self._subscriptions[track_name] 
-                    if s.session_id != client.session_id
-                ]
-                if not self._subscriptions[track_name]:
-                    del self._subscriptions[track_name]
-
     def get_cache_stats(self) -> dict:
-        """Get cache statistics."""
-        return self.cache.get_statistics()
-
-    # =========================================================================
-    # Public API for backward compatibility with tests
-    # These methods provide a simpler interface for JSON-based message handling
-    # =========================================================================
+        """获取缓存统计"""
+        return self._relay.get_cache_stats()
+    
+    # ========== 测试兼容属性 ==========
     
     @property
-    def subscribers(self):
-        """Backward compatibility: expose _subscriptions as subscribers (using string keys)."""
-        # Convert FullTrackName keys to string keys for test compatibility
-        if not hasattr(self, '_test_subscribers'):
-            self._test_subscribers = {}
-        return self._test_subscribers
+    def subscribers(self) -> Dict[str, Set[MockWriter]]:
+        """获取订阅者字典 (track_id -> set of writers)"""
+        return self._subscribers
     
     @property
-    def publishers(self):
-        """Backward compatibility: expose _publications as publishers (using string keys)."""
-        # Convert FullTrackName keys to string keys for test compatibility
-        if not hasattr(self, '_test_publishers'):
-            self._test_publishers = {}
-        return self._test_publishers
+    def publishers(self) -> Dict[str, MockWriter]:
+        """获取发布者字典 (track_id -> writer)"""
+        return self._publishers
     
     @property
-    def tracks(self):
-        """Track information for backward compatibility."""
-        if not hasattr(self, '_tracks'):
-            self._tracks = {}
+    def tracks(self) -> Dict[str, dict]:
+        """获取轨道字典 (track_id -> track_info)"""
         return self._tracks
     
-    async def handle_subscribe(self, writer, msg: dict):
-        """Public API: Handle subscribe request from tests (JSON format)."""
-        track_id = msg.get('track_id', '')
+    # ========== 测试兼容方法 ==========
+    
+    async def handle_subscribe(self, writer: MockWriter, msg: dict):
+        """
+        处理订阅请求 (JSON格式)
         
-        # Store subscription info for test compatibility using string keys
-        if track_id not in self.subscribers:
-            self.subscribers[track_id] = set()
-        self.subscribers[track_id].add(writer)
+        消息格式: {
+            "type": "SUBSCRIBE",
+            "track_id": "track-name",
+            ...
+        }
+        """
+        track_id = msg.get("track_id")
+        if not track_id:
+            await self.send_message(writer, {
+                "type": "ERROR",
+                "error": "Missing track_id"
+            })
+            return
         
-        # Send SUBSCRIBE_OK response
-        response = {
+        # 记录订阅
+        if track_id not in self._subscribers:
+            self._subscribers[track_id] = set()
+        self._subscribers[track_id].add(writer)
+        
+        # 初始化track信息
+        if track_id not in self._tracks:
+            self._tracks[track_id] = {
+                "id": track_id,
+                "created_at": datetime.now().isoformat(),
+                "subscriber_count": 0
+            }
+        
+        self._tracks[track_id]["subscriber_count"] = len(self._subscribers[track_id])
+        
+        # 发送确认
+        await self.send_message(writer, {
             "type": "SUBSCRIBE_OK",
             "track_id": track_id
-        }
-        await self.send_message(writer, response)
+        })
+        
+        logger.info(f"Subscription added for track: {track_id}")
     
-    async def handle_publish(self, writer, msg: dict):
-        """Public API: Handle publish request from tests (JSON format)."""
-        track_id = msg.get('track_id', '')
+    async def handle_publish(self, writer: MockWriter, msg: dict):
+        """处理发布请求"""
+        track_id = msg.get("track_id")
+        if not track_id:
+            await self.send_message(writer, {
+                "type": "ERROR",
+                "error": "Missing track_id"
+            })
+            return
         
-        # Store publication info for test compatibility using string keys
-        self.publishers[track_id] = writer
-        self.tracks[track_id] = {"publisher": writer}
+        # 检查是否已有发布者
+        if track_id in self._publishers:
+            await self.send_message(writer, {
+                "type": "ERROR",
+                "error": f"Track {track_id} already has a publisher"
+            })
+            return
         
-        # Send PUBLISH_OK response
-        response = {
+        # 记录发布者
+        self._publishers[track_id] = writer
+        
+        # 初始化track信息
+        if track_id not in self._tracks:
+            self._tracks[track_id] = {
+                "id": track_id,
+                "created_at": datetime.now().isoformat(),
+                "publisher": writer.session_id
+            }
+        
+        # 发送确认
+        await self.send_message(writer, {
             "type": "PUBLISH_OK",
             "track_id": track_id
-        }
-        await self.send_message(writer, response)
+        })
+        
+        logger.info(f"Publication registered for track: {track_id}")
     
-    async def handle_object(self, writer, msg: dict):
-        """Public API: Handle object message from tests (JSON format)."""
-        track_id = msg.get('track_id', '')
-        data = msg.get('data', {})
+    async def handle_object(self, writer: MockWriter, msg: dict):
+        """处理对象消息（转发给订阅者）"""
+        track_id = msg.get("track_id")
+        if not track_id:
+            return
         
-        # Verify publisher is authorized
-        if track_id in self.tracks:
-            if self.tracks[track_id].get("publisher") != writer:
-                return  # Unauthorized publisher
+        # 验证发布者权限
+        if track_id not in self._publishers or self._publishers[track_id] != writer:
+            await self.send_message(writer, {
+                "type": "ERROR",
+                "error": "Not authorized to publish to this track"
+            })
+            return
         
-        # Find subscribers for this track
-        subscribers = self.subscribers.get(track_id, set())
-        if not subscribers:
-            return  # No subscribers
-        
-        # Create object message
-        obj_msg = {
-            "type": "OBJECT",
-            "track_id": track_id,
-            "data": data
-        }
-        
-        # Forward to all subscribers
-        dead_subscribers = set()
-        for subscriber in subscribers:
-            try:
-                await self.send_message(subscriber, obj_msg)
-            except Exception:
-                dead_subscribers.add(subscriber)
-        
-        # Remove dead subscribers
-        self.subscribers[track_id] = subscribers - dead_subscribers
+        # 转发给所有订阅者
+        if track_id in self._subscribers:
+            dead_subscribers = set()
+            
+            for subscriber in self._subscribers[track_id]:
+                try:
+                    if subscriber.is_closing():
+                        dead_subscribers.add(subscriber)
+                    else:
+                        await self.send_message(subscriber, msg)
+                except Exception as e:
+                    logger.warning(f"Failed to forward to subscriber: {e}")
+                    dead_subscribers.add(subscriber)
+            
+            # 清理断开的订阅者
+            for dead in dead_subscribers:
+                self._subscribers[track_id].discard(dead)
+                logger.info(f"Removed dead subscriber from {track_id}")
+            
+            # 如果没有订阅者了，清理track
+            if not self._subscribers[track_id]:
+                del self._subscribers[track_id]
+                logger.info(f"No more subscribers for track: {track_id}")
     
-    async def handle_unsubscribe(self, writer, msg: dict):
-        """Public API: Handle unsubscribe request from tests."""
-        track_id = msg.get('track_id', '')
+    async def handle_unsubscribe(self, writer: MockWriter, msg: dict):
+        """处理取消订阅"""
+        track_id = msg.get("track_id")
+        if not track_id:
+            return
         
-        # Find and remove subscriber
-        if track_id in self.subscribers:
-            self.subscribers[track_id].discard(writer)
+        if track_id in self._subscribers:
+            self._subscribers[track_id].discard(writer)
+            
+            if not self._subscribers[track_id]:
+                del self._subscribers[track_id]
+                logger.info(f"Removed track {track_id} (no subscribers)")
+            else:
+                logger.info(f"Unsubscribed from {track_id}")
         
-        # Send UNSUBSCRIBE_OK response
-        response = {
-            "type": "UNSUBSCRIBE_OK",
-            "track_id": track_id
-        }
-        await self.send_message(writer, response)
+        # 更新track统计
+        if track_id in self._tracks:
+            self._tracks[track_id]["subscriber_count"] = len(
+                self._subscribers.get(track_id, set())
+            )
     
-    async def cleanup_client(self, writer):
-        """Public API: Clean up when a client disconnects from tests."""
-        # Remove from tracks and publishers
-        for track_id in list(self.tracks.keys()):
-            if self.tracks[track_id].get("publisher") == writer:
-                del self.tracks[track_id]
-                if track_id in self.publishers:
-                    del self.publishers[track_id]
+    async def cleanup_client(self, writer: MockWriter):
+        """清理断开连接的客户端"""
+        # 从发布者中移除
+        tracks_to_remove = []
+        for track_id, pub_writer in list(self._publishers.items()):
+            if pub_writer == writer:
+                tracks_to_remove.append(track_id)
         
-        # Remove from subscriptions
-        for track_id in list(self.subscribers.keys()):
-            self.subscribers[track_id].discard(writer)
+        for track_id in tracks_to_remove:
+            del self._publishers[track_id]
+            logger.info(f"Removed publisher for track: {track_id}")
+        
+        # 从订阅者中移除
+        for track_id, subscribers in list(self._subscribers.items()):
+            if writer in subscribers:
+                subscribers.discard(writer)
+                if not subscribers:
+                    del self._subscribers[track_id]
+                    logger.info(f"Removed track {track_id} (no subscribers)")
+        
+        writer.close()
+        logger.info(f"Cleaned up client: {writer.session_id}")
     
-    async def send_message(self, writer, msg: dict):
-        """Public API: Send a JSON message to a writer."""
-        import struct
+    async def send_message(self, writer: MockWriter, msg: dict):
+        """
+        发送JSON消息（带4字节长度前缀）
         
-        json_data = json.dumps(msg).encode('utf-8')
-        length_prefix = struct.pack('!I', len(json_data))
-        
+        格式: [4字节长度(大端)] + [JSON数据]
+        """
         try:
-            if hasattr(writer, 'write'):
-                result = writer.write(length_prefix + json_data)
-                # Handle async write methods
-                if asyncio.iscoroutine(result):
-                    await result
-                if hasattr(writer, 'drain'):
-                    drain_result = writer.drain()
-                    if asyncio.iscoroutine(drain_result):
-                        await drain_result
+            data = json.dumps(msg).encode('utf-8')
+            length = struct.pack('>I', len(data))  # 4字节大端
+            writer.write(length + data)
+            await writer.drain()
         except Exception as e:
-            # Re-raise to allow caller to handle dead subscribers
-            raise e
+            logger.error(f"Failed to send message: {e}")
 
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    relay = MOQTRelay()
-    asyncio.run(relay.start())
+# 保持向后兼容：导出MOQTRelay
+__all__ = ['MOQTRelay', 'MockWriter']

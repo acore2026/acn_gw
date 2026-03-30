@@ -93,7 +93,7 @@ coverage: venv
 	@$(VENV_BIN)/python run_tests.py -c
 
 # Maintenance commands
-clean: clean-pyc
+clean: clean-pyc clean-moq-cache
 	@echo "Removing virtual environment..."
 	@rm -rf $(VENV_DIR)
 	@rm -rf htmlcov/
@@ -107,6 +107,13 @@ clean-pyc:
 	@find . -type d -name "__pycache__" -delete
 	@find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
 	@echo "Cache files removed"
+
+clean-moq-cache:
+	@echo "Cleaning MOQ relay cache..."
+	@rm -rf .relay_cache/
+	@rm -rf moq-py/.relay_cache/
+	@rm -rf moq-py/.moq_cache/
+	@echo "MOQ cache cleaned"
 
 lint: venv
 	@echo "Running linters..."
