@@ -23,7 +23,7 @@ def event_loop():
 @pytest.fixture(autouse=True)
 def reset_database():
     """Reset database before each test"""
-    from models import Base, engine
+    from agent_gw.models import Base, engine
     # Clean up any existing tables
     Base.metadata.drop_all(engine)
     # Create fresh tables

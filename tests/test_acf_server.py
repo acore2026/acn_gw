@@ -13,15 +13,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import websockets
-from acf_server import ACFServer
-from models import Base, Agent, Task, engine, SessionLocal
-
-@pytest.fixture(autouse=True)
-def setup_database():
-    """Setup and teardown database for each test"""
-    Base.metadata.create_all(engine)
-    yield
-    Base.metadata.drop_all(engine)
+from agent_gw.acf_server import ACFServer
+from agent_gw.models import Agent, Task, Track, SessionLocal
 
 @pytest.fixture
 def acf_server():
@@ -71,8 +64,8 @@ class TestACFSetup:
         db.close()
         
         # Verify response sent
-        mock_ws.send.assert_called_once()
-        response = json.loads(mock_ws.send.call_args[0][0])
+        mock_ws.send_text.assert_called_once()
+        response = json.loads(mock_ws.send_text.call_args[0][0])
         assert response["type"] == "SETUP"
         assert response["payload"]["status"] == "OK"
     
@@ -123,8 +116,8 @@ class TestACFMessageForwarding:
         await acf_server.handle_task_request_collaboration(msg)
         
         # Verify message forwarded to destination
-        mock_ws_dst.send.assert_called_once()
-        sent_msg = json.loads(mock_ws_dst.send.call_args[0][0])
+        mock_ws_dst.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws_dst.send_text.call_args[0][0])
         assert sent_msg["type"] == "TASK_REQUEST_COLLABORATION"
         assert sent_msg["payload"]["dst_agent_id"] == "dst-agent"
     
@@ -143,22 +136,9 @@ class TestACFMessageForwarding:
     async def test_forward_task_accept_collaboration(self, acf_server):
         """Test handling TASK_ACCEPT_COLLABORATION"""
         # Setup connections
-        mock_ws_src = AsyncMock()
         mock_ws_dst = AsyncMock()
-        
-        acf_server.connections["accepting-agent"] = mock_ws_src
+
         acf_server.connections["requesting-agent"] = mock_ws_dst
-        acf_server.connections["ARF"] = AsyncMock()  # ARF connection
-        
-        # Create accepting agent in DB
-        db = SessionLocal()
-        agent = Agent(
-            agent_id="accepting-agent",
-            agent_name="Accepting Agent"
-        )
-        db.add(agent)
-        db.commit()
-        db.close()
         
         # Message
         msg = {
@@ -173,16 +153,321 @@ class TestACFMessageForwarding:
         }
         
         await acf_server.handle_task_accept_collaboration(msg)
-        
-        # Verify task recorded in database
+
+        # Verify direct DISCOVER_RESULT to requester
+        mock_ws_dst.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws_dst.send_text.call_args[0][0])
+        assert sent_msg["type"] == "DISCOVER_RESULT"
+        assert sent_msg["payload"]["discover_result"] == ["accepting-agent"]
+        assert sent_msg["payload"]["dst_agent_id"] == "requesting-agent"
+
+    async def test_handle_discoveries_http(self, acf_server):
+        """Test HTTP discovery requests are forwarded to the destination agent."""
+        mock_ws = AsyncMock()
+        acf_server.connections["dst-agent"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "body": {
+                "src_agent_id": "ARF",
+                "dst_agent_id": "dst-agent",
+                "task_id": "task-002",
+                "task_description": "Collaboration task",
+                "agent_card": {
+                    "agent_id": "dst-agent",
+                    "skill": ["camera", "night_vision"]
+                },
+                "timestamp": "2025-01-01T00:00:00Z"
+            }
+        }
+
+        response = await acf_server.handle_discoveries(request)
+
+        assert response.status_code == 200
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+        assert sent_msg["type"] == "TASK_REQUEST_COLLABORATION"
+        assert sent_msg["payload"]["dst_agent_id"] == "dst-agent"
+        assert sent_msg["payload"]["task_id"] == "task-002"
+
+    async def test_publish_track_persists_deduped_tracks(self, acf_server):
+        """Test PUBLISH_TRACK stores deduplicated track metadata."""
+        msg = {
+            "type": "PUBLISH_TRACK",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "payload": {
+                "src_agent_id": "did:acn:agent:222222222",
+                "task_id": "task-12345",
+                "track_list": [
+                    {
+                        "namespace": "/task-12345/did:acn:agent:222222222",
+                        "track": "Video"
+                    },
+                    {
+                        "namespace": "/task-12345/did:acn:agent:222222222",
+                        "track": "Video"
+                    },
+                    {
+                        "namespace": "/task-12345/did:acn:agent:222222222",
+                        "track": "Location"
+                    }
+                ]
+            }
+        }
+
+        await acf_server.handle_publish_track(msg)
+
         db = SessionLocal()
-        task = db.query(Task).filter_by(task_id="task-002").first()
-        assert task is not None
-        assert task.agent_id == "accepting-agent"
+        track = db.query(Track).filter_by(task_id="task-12345").first()
+        assert track is not None
+        assert track.src_agent_id == "did:acn:agent:222222222"
+        assert len(track.track_list) == 2
+        tracks = {(item["namespace"], item["track"]) for item in track.track_list}
+        assert tracks == {
+            ("/task-12345/did:acn:agent:222222222", "Video"),
+            ("/task-12345/did:acn:agent:222222222", "Location"),
+        }
         db.close()
-        
-        # Verify forwarded to destination
-        mock_ws_dst.send.assert_called_once()
+
+    async def test_publish_track_dedupes_per_task_only(self, acf_server):
+        """Test identical track items are preserved across different task_ids."""
+        common_tracks = [
+            {
+                "namespace": "/task/shared/did:acn:agent:222222222",
+                "track": "Video"
+            },
+            {
+                "namespace": "/task/shared/did:acn:agent:222222222",
+                "track": "Location"
+            }
+        ]
+
+        for task_id in ("task-a", "task-b"):
+            await acf_server.handle_publish_track({
+                "type": "PUBLISH_TRACK",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "payload": {
+                    "src_agent_id": "did:acn:agent:222222222",
+                    "task_id": task_id,
+                    "track_list": common_tracks,
+                }
+            })
+
+        db = SessionLocal()
+        task_a = db.query(Track).filter_by(task_id="task-a").first()
+        task_b = db.query(Track).filter_by(task_id="task-b").first()
+        assert task_a is not None
+        assert task_b is not None
+        assert task_a.track_list == common_tracks
+        assert task_b.track_list == common_tracks
+        assert task_a.src_agent_id == "did:acn:agent:222222222"
+        assert task_b.src_agent_id == "did:acn:agent:222222222"
+        db.close()
+
+    async def test_task_execution_subscribes_tracks(self, acf_server):
+        """Test task-execution notification triggers SUBSCRIBE_TRACK."""
+        publish_msg = {
+            "type": "PUBLISH_TRACK",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "payload": {
+                "src_agent_id": "did:acn:agent:222222222",
+                "task_id": "task-12345",
+                "track_list": [
+                    {
+                        "namespace": "/task-12345/did:acn:agent:222222222",
+                        "track": "Video"
+                    },
+                    {
+                        "namespace": "/task-12345/did:acn:agent:222222222",
+                        "track": "Location"
+                    }
+                ]
+            }
+        }
+        await acf_server.handle_publish_track(publish_msg)
+
+        mock_ws = AsyncMock()
+        acf_server.connections["did:acn:agent:222222222"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "body": {
+                "agent_id": "did:acn:agent:222222222",
+                "task_id": "task-12345",
+                "description": "危险区域可以人员巡检",
+                "timestamp": "2025-01-01T00:00:00Z"
+            }
+        }
+
+        response = await acf_server.handle_task_executions(request)
+
+        assert response.status_code == 200
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+        assert sent_msg["type"] == "SUBSCRIBE_TRACK"
+        assert sent_msg["payload"]["task_id"] == "task-12345"
+        assert len(sent_msg["payload"]["track_list"]) == 2
+
+    async def test_start_task_forwards_to_agent(self, acf_server):
+        """Test START_TASK is forwarded to the destination agent."""
+        mock_ws = AsyncMock()
+        acf_server.connections["did:acn:agent:111111111"] = mock_ws
+
+        msg = {
+            "type": "START_TASK",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "payload": {
+                "src_agent_id": "did:acn:agent:222222222",
+                "dst_agent_id": "did:acn:agent:111111111",
+                "task_id": "task-12345",
+                "task_description": "Collaboration task"
+            }
+        }
+
+        await acf_server.handle_start_task(msg)
+
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+        assert sent_msg["type"] == "START_TASK"
+        assert sent_msg["payload"]["dst_agent_id"] == "did:acn:agent:111111111"
+
+    async def test_disconnection_removes_tracks_and_closes_socket(self, acf_server):
+        """Test DISCONNECTION closes the socket and removes tracks for the agent."""
+        db = SessionLocal()
+        db.add(Track(
+            src_agent_id="did:acn:agent:disconnect-me",
+            task_id="task-1",
+            track_list=[
+                {
+                    "namespace": "/task-1/did:acn:agent:disconnect-me",
+                    "track": "Video"
+                }
+            ]
+        ))
+        db.add(Track(
+            src_agent_id="did:acn:agent:disconnect-me",
+            task_id="task-2",
+            track_list=[
+                {
+                    "namespace": "/task-2/did:acn:agent:disconnect-me",
+                    "track": "Location"
+                }
+            ]
+        ))
+        db.add(Track(
+            src_agent_id="did:acn:agent:other",
+            task_id="task-3",
+            track_list=[
+                {
+                    "namespace": "/task-3/did:acn:agent:other",
+                    "track": "Video"
+                }
+            ]
+        ))
+        db.commit()
+        db.close()
+
+        mock_ws = AsyncMock()
+        acf_server.connections["did:acn:agent:disconnect-me"] = mock_ws
+
+        msg = {
+            "type": "DISCONNECTION",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "payload": {
+                "src_agent_id": "did:acn:agent:disconnect-me"
+            }
+        }
+
+        await acf_server.handle_disconnection(mock_ws, msg)
+
+        mock_ws.close.assert_called_once()
+        assert "did:acn:agent:disconnect-me" not in acf_server.connections
+
+        db = SessionLocal()
+        remaining = db.query(Track).all()
+        remaining_task_ids = sorted(track.task_id for track in remaining)
+        assert remaining_task_ids == ["task-3"]
+        assert remaining[0].src_agent_id == "did:acn:agent:other"
+        db.close()
+
+    async def test_clear_broadcasts_clear_and_resets_state(self, acf_server):
+        """Test /clear broadcasts CLEAR and deletes local state."""
+        db = SessionLocal()
+        db.add(Agent(agent_id="agent-clear-1", agent_status="online"))
+        db.add(Task(agent_id="agent-clear-1", task_id="task-clear-1", task_description="x"))
+        db.add(Track(
+            src_agent_id="agent-clear-1",
+            task_id="task-clear-1",
+            track_list=[{"namespace": "/task-clear-1/agent-clear-1", "track": "Video"}],
+        ))
+        db.commit()
+        db.close()
+
+        mock_ws1 = AsyncMock()
+        mock_ws2 = AsyncMock()
+        acf_server.connections["agent-clear-1"] = mock_ws1
+        acf_server.connections["agent-clear-2"] = mock_ws2
+
+        request = AsyncMock()
+        request.json.return_value = {"body": {}}
+
+        response = await acf_server.handle_clear(request)
+
+        assert response.status_code == 200
+        assert acf_server.connections == {}
+        mock_ws1.send_text.assert_called_once()
+        mock_ws2.send_text.assert_called_once()
+        mock_ws1.close.assert_called_once()
+        mock_ws2.close.assert_called_once()
+
+        db = SessionLocal()
+        assert db.query(Agent).count() == 0
+        assert db.query(Task).count() == 0
+        assert db.query(Track).count() == 0
+        db.close()
+
+    async def test_agent_deletions_clears_agent_rows_and_disconnects(self, acf_server):
+        """Test agent deletion removes local state and disconnects the agent."""
+        db = SessionLocal()
+        db.add(Agent(agent_id="agent-delete-1", agent_status="online"))
+        db.add(Task(agent_id="agent-delete-1", task_id="task-delete-1", task_description="x"))
+        db.add(Track(
+            src_agent_id="agent-delete-1",
+            task_id="task-delete-1",
+            track_list=[{"namespace": "/task-delete-1/agent-delete-1", "track": "Video"}],
+        ))
+        db.add(Track(
+            src_agent_id="agent-delete-2",
+            task_id="task-delete-2",
+            track_list=[{"namespace": "/task-delete-2/agent-delete-2", "track": "Location"}],
+        ))
+        db.commit()
+        db.close()
+
+        mock_ws = AsyncMock()
+        acf_server.connections["agent-delete-1"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "agent_id": "agent-delete-1",
+            "reason": "retired",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "signature": "xxxxxxx",
+            "signature_encoding": "base64",
+        }
+
+        response = await acf_server.handle_agent_deletions(request)
+
+        assert response.status_code == 200
+        mock_ws.close.assert_called_once()
+        assert "agent-delete-1" not in acf_server.connections
+
+        db = SessionLocal()
+        assert db.query(Agent).filter_by(agent_id="agent-delete-1").first() is None
+        assert db.query(Task).filter_by(agent_id="agent-delete-1").count() == 0
+        assert db.query(Track).filter_by(src_agent_id="agent-delete-1").count() == 0
+        assert db.query(Track).filter_by(src_agent_id="agent-delete-2").count() == 1
+        db.close()
     
     async def test_forward_discover_result(self, acf_server):
         """Test forwarding DISCOVER_RESULT"""
@@ -202,8 +487,8 @@ class TestACFMessageForwarding:
         await acf_server.handle_discover_result(msg)
         
         # Verify forwarded
-        mock_ws.send.assert_called_once()
-        sent_msg = json.loads(mock_ws.send.call_args[0][0])
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
         assert sent_msg["payload"]["discover_result"][0] == "did:acn:agent:found"
 
 @pytest.mark.asyncio
@@ -262,7 +547,7 @@ class TestACFWebSocketHandler:
         class MockWebSocket:
             def __init__(self, msgs):
                 self.messages = msgs
-                self.send = AsyncMock()
+                self.send_text = AsyncMock()
                 self._closed = False
                 
             def __aiter__(self):
@@ -306,7 +591,7 @@ class TestACFWebSocketHandler:
         class MockWebSocket:
             def __init__(self, msgs):
                 self.messages = msgs
-                self.send = AsyncMock()
+                self.send_text = AsyncMock()
                 
             def __aiter__(self):
                 return self
@@ -328,7 +613,7 @@ class TestACFWebSocketHandler:
         class MockWebSocket:
             def __init__(self, msgs):
                 self.messages = msgs
-                self.send = AsyncMock()
+                self.send_text = AsyncMock()
                 
             def __aiter__(self):
                 return self
@@ -392,6 +677,6 @@ class TestACFMultipleAgents:
         await acf_server.handle_task_request_collaboration(msg)
         
         # Only agent-2 should receive the message
-        mock_ws1.send.assert_not_called()
-        mock_ws2.send.assert_called_once()
-        mock_ws3.send.assert_not_called()
+        mock_ws1.send_text.assert_not_called()
+        mock_ws2.send_text.assert_called_once()
+        mock_ws3.send_text.assert_not_called()

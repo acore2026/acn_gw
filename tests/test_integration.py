@@ -13,14 +13,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import Base, Agent, Task, engine, SessionLocal
-
-@pytest.fixture(autouse=True)
-def setup_database():
-    """Setup database for integration tests"""
-    Base.metadata.create_all(engine)
-    yield
-    Base.metadata.drop_all(engine)
+from agent_gw.models import Agent, Task, Track, SessionLocal
 
 @pytest.mark.asyncio
 class TestAgentRegistrationFlow:
@@ -30,21 +23,25 @@ class TestAgentRegistrationFlow:
     async def test_agent_registers_then_connects(self, mock_post):
         """Test agent registers via ARF then connects via ACF"""
         from fastapi.testclient import TestClient
-        from arf_server import app
-        from acf_server import ACFServer
+        from agent_gw.arf_server import app
+        from agent_gw.acf_server import ACFServer
         
         # Setup
         client = TestClient(app)
         
         # Mock IDM response
         mock_response = MagicMock()
-        mock_response.json.return_value = {"Valid": True, "VCId": ["test"]}
+        mock_response.json.return_value = {
+            "valid": True,
+            "vc_ids": ["test"],
+            "invalid_vcs": None,
+        }
         mock_post.return_value = mock_response
         
         # Step 1: Agent registers via ARF
         reg_payload = {
+            "agent_id": "did:acn:agent:integration001",
             "body": {
-                "agent_id": "did:acn:agent:integration001",
                 "priority": 1,
                 "vc_list": [{
                     "claims": {
@@ -72,7 +69,7 @@ class TestDiscoveryAndCollaborationFlow:
     
     async def test_full_discovery_flow(self):
         """Test complete discovery -> collaboration flow"""
-        from acf_server import ACFServer
+        from agent_gw.acf_server import ACFServer
         
         # Setup ACF
         acf = ACFServer(host='localhost', port=9997)
@@ -111,11 +108,10 @@ class TestDiscoveryAndCollaborationFlow:
         # Step 1: Discovery request (simulated)
         # In real scenario, this comes from HTTP API
         
-        # Step 2: ARF sends TASK_REQUEST_COLLABORATION via ACF
-        collab_msg = {
-            "type": "TASK_REQUEST_COLLABORATION",
-            "timestamp": datetime.utcnow().isoformat() + 'Z',
-            "payload": {
+        # Step 2: ARF sends an HTTP discovery request to ACF
+        discovery_request = AsyncMock()
+        discovery_request.json.return_value = {
+            "body": {
                 "src_agent_id": "ARF",
                 "dst_agent_id": "did:acn:agent:available",
                 "task_id": "task-integration-001",
@@ -123,15 +119,16 @@ class TestDiscoveryAndCollaborationFlow:
                 "agent_card": {
                     "agent_id": "did:acn:agent:available",
                     "skill": ["camera", "night_vision"]
-                }
+                },
+                "timestamp": datetime.utcnow().isoformat() + 'Z'
             }
         }
-        
-        await acf.handle_task_request_collaboration(collab_msg)
+
+        await acf.handle_discoveries(discovery_request)
         
         # Verify forwarded to available agent
-        mock_ws_available.send.assert_called_once()
-        sent_msg = json.loads(mock_ws_available.send.call_args[0][0])
+        mock_ws_available.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws_available.send_text.call_args[0][0])
         assert sent_msg["payload"]["task_id"] == "task-integration-001"
         
         # Step 3: Available agent accepts
@@ -146,21 +143,103 @@ class TestDiscoveryAndCollaborationFlow:
             }
         }
         
-        # Add ARF connection
-        mock_ws_arf = AsyncMock()
-        acf.connections["ARF"] = mock_ws_arf
-        
         await acf.handle_task_accept_collaboration(accept_msg)
-        
-        # Verify task recorded
+
+        # Verify direct discover result to requester
+        mock_ws_requester.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws_requester.send_text.call_args[0][0])
+        assert sent_msg["type"] == "DISCOVER_RESULT"
+        assert sent_msg["payload"]["discover_result"] == ["did:acn:agent:available"]
+
+        # Step 4: publish track metadata before the task starts
+        publish_msg = {
+            "type": "PUBLISH_TRACK",
+            "timestamp": datetime.utcnow().isoformat() + 'Z',
+            "payload": {
+                "src_agent_id": "did:acn:agent:available",
+                "task_id": "task-integration-001",
+                "track_list": [
+                    {
+                        "namespace": "/task-integration-001/did:acn:agent:available",
+                        "track": "Video"
+                    },
+                    {
+                        "namespace": "/task-integration-001/did:acn:agent:available",
+                        "track": "Location"
+                    }
+                ]
+            }
+        }
+        await acf.handle_publish_track(publish_msg)
+
+        db = SessionLocal()
+        track = db.query(Track).filter_by(task_id="task-integration-001").first()
+        assert track is not None
+        assert track.src_agent_id == "did:acn:agent:available"
+        assert len(track.track_list) == 2
+        db.close()
+
+        # Step 5: available agent reports task execution to ARF
+        from fastapi.testclient import TestClient
+        from agent_gw.arf_server import app as arf_app
+
+        client = TestClient(arf_app)
+        execution_payload = {
+            "body": {
+                "agent_id": "did:acn:agent:available",
+                "task_id": "task-integration-001",
+                "description": "Integration test task",
+                "timestamp": datetime.utcnow().isoformat() + 'Z'
+            }
+        }
+
+        with patch('agent_gw.arf_server.httpx.AsyncClient') as mock_async_client:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            response = client.post("/acn-agent/v1/task-executions", json=execution_payload)
+
+        assert response.status_code == 200
+
         db = SessionLocal()
         task = db.query(Task).filter_by(task_id="task-integration-001").first()
         assert task is not None
         assert task.agent_id == "did:acn:agent:available"
         db.close()
-        
-        # Verify forwarded to requester
-        mock_ws_requester.send.assert_called_once()
+
+        # Step 6: ARF forwards task execution to ACF, which subscribes the agent to tracks
+        subscribe_request = AsyncMock()
+        subscribe_request.json.return_value = {
+            "body": execution_payload["body"]
+        }
+        response = await acf.handle_task_executions(subscribe_request)
+        assert response.status_code == 200
+        assert mock_ws_available.send_text.call_count == 2
+        sent_msg = json.loads(mock_ws_available.send_text.call_args_list[1][0][0])
+        assert sent_msg["type"] == "SUBSCRIBE_TRACK"
+        assert sent_msg["payload"]["task_id"] == "task-integration-001"
+
+        # Step 7: task termination removes the task record
+        termination_payload = {
+            "body": {
+                "agent_id": "did:acn:agent:available",
+                "task_id": "task-integration-001",
+                "reason": "目标已离开区域，任务完成",
+                "timestamp": datetime.utcnow().isoformat() + 'Z',
+                "force": "false"
+            }
+        }
+        response = client.post("/acn-agent/v1/task-execution-terminations", json=termination_payload)
+        assert response.status_code == 200
+
+        db = SessionLocal()
+        task = db.query(Task).filter_by(task_id="task-integration-001").first()
+        assert task is None
+        db.close()
 
 @pytest.mark.asyncio
 class TestErrorScenarios:
@@ -168,7 +247,7 @@ class TestErrorScenarios:
     
     async def test_agent_disconnects_mid_task(self):
         """Test handling when agent disconnects during collaboration"""
-        from acf_server import ACFServer
+        from agent_gw.acf_server import ACFServer
         
         acf = ACFServer(host='localhost', port=9996)
         
@@ -205,7 +284,7 @@ class TestErrorScenarios:
     
     async def test_discovery_no_online_agents(self):
         """Test discovery when no agents are online"""
-        from acf_server import ACFServer
+        from agent_gw.acf_server import ACFServer
         
         acf = ACFServer(host='localhost', port=9995)
         
@@ -229,7 +308,7 @@ class TestErrorScenarios:
     
     async def test_capability_matching_edge_cases(self):
         """Test capability matching with edge cases"""
-        from acf_server import ACFServer
+        from agent_gw.acf_server import ACFServer
         
         db = SessionLocal()
         
@@ -283,7 +362,7 @@ class TestMultipleAgentsScenario:
     
     async def test_many_agents_connect(self):
         """Test handling many agents connecting"""
-        from acf_server import ACFServer
+        from agent_gw.acf_server import ACFServer
         
         acf = ACFServer(host='localhost', port=9994)
         
@@ -323,7 +402,7 @@ class TestMultipleAgentsScenario:
     
     async def test_broadcast_message_to_multiple(self):
         """Test message handling with multiple recipients"""
-        from acf_server import ACFServer
+        from agent_gw.acf_server import ACFServer
         
         acf = ACFServer(host='localhost', port=9993)
         
@@ -345,50 +424,46 @@ class TestMultipleAgentsScenario:
         # Only agent-2 should receive
         for i, mock_ws in enumerate(mock_ws_list):
             if i == 2:
-                mock_ws.send.assert_called_once()
+                mock_ws.send_text.assert_called_once()
             else:
-                mock_ws.send.assert_not_called()
+                mock_ws.send_text.assert_not_called()
 
 @pytest.mark.asyncio
 class TestMOQTWithAgents:
     """Test MOQT Relay with agent scenarios"""
     
     async def test_agent_publishes_sensor_data(self):
-        """Test agent publishing sensor data via MOQT"""
-        from moqt_relay import MOQTRelay
-        
-        relay = MOQTRelay(host='localhost', port=9992)
-        
-        # Agent publishes track
-        pub_reader, pub_writer = AsyncMock(), AsyncMock()
-        await relay.handle_publish(pub_writer, {
-            "type": "PUBLISH",
-            "track_id": "agent-1-sensors"
-        })
-        
-        # Other agents subscribe
-        sub_writers = []
-        for i in range(3):
-            sub_reader, sub_writer = AsyncMock(), AsyncMock()
-            await relay.handle_subscribe(sub_writer, {
-                "type": "SUBSCRIBE",
-                "track_id": "agent-1-sensors"
-            })
-            sub_writers.append(sub_writer)
-        
-        # Agent publishes sensor data
+        """Test agent sensor data being cached by the relay."""
+        from moq import FullTrackName, Location
+        from moq.relay import MOQRelay, CachedObject
+
+        relay = MOQRelay(
+            host='localhost',
+            port=9992,
+            cache_dir='.test_integration_cache',
+        )
+
+        track_name = FullTrackName([b'agent', b'sensors'], b'agent-1')
+
         for reading in range(10):
-            await relay.handle_object(pub_writer, {
-                "type": "OBJECT",
-                "track_id": "agent-1-sensors",
-                "data": {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "temperature": 20.0 + reading,
-                    "humidity": 50.0 + reading
-                }
-            })
-        
-        # All subscribers should receive 10 objects
-        for sub_writer in sub_writers:
-            # SUBSCRIBE_OK + 10 objects
-            assert sub_writer.write.call_count == 11
+            relay.cache_object(
+                track_name,
+                CachedObject(
+                    track_alias=1,
+                    group_id=1,
+                    object_id=reading,
+                    publisher_priority=128,
+                    payload=json.dumps({
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'temperature': 20.0 + reading,
+                        'humidity': 50.0 + reading,
+                    }).encode('utf-8'),
+                ),
+            )
+
+        stats = relay.get_cache_stats()
+        assert stats['memory_objects'] == 10
+
+        cached = relay.cache.get(track_name, Location(1, 0))
+        assert cached is not None
+        assert b'temperature' in cached.payload

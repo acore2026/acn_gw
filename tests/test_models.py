@@ -8,7 +8,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import Base, Agent, Task, Track, SessionLocal, engine
+from agent_gw.models import Base, Agent, Task, Track, SessionLocal, engine
 
 @pytest.fixture
 def db_session():
@@ -139,6 +139,7 @@ class TestTrackModel:
     def test_create_track(self, db_session):
         """Test creating a track"""
         track = Track(
+            src_agent_id="did:acn:agent:444444444",
             task_id="task-12345",
             track_list=["track-1", "track-2", "track-3"]
         )
@@ -148,6 +149,7 @@ class TestTrackModel:
         # Verify
         result = db_session.query(Track).filter_by(task_id="task-12345").first()
         assert result is not None
+        assert result.src_agent_id == "did:acn:agent:444444444"
         assert len(result.track_list) == 3
         assert "track-1" in result.track_list
 
