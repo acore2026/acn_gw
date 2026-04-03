@@ -34,7 +34,7 @@ cd acn_gw
 source venv/bin/activate
 
 # Start the application
-python3 main.py
+./start_agent_gw.sh
 ```
 
 ### Option 2: Using Direct Commands
@@ -44,7 +44,7 @@ python3 main.py
 ./setup.sh
 
 # Run all services
-python3 main.py
+./start_agent_gw.sh
 
 # Run tests
 pytest
@@ -63,13 +63,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 # Run the application
-python3 main.py
+./start_agent_gw.sh
 ```
 
 ## Project Structure
 
 ```
 .
+├── agent_gw.py           # Repository entry point
+├── start_agent_gw.sh     # Background start/restart script
 ├── moqt/                   # MOQT protocol implementation
 │   ├── encoding/          # Encoding utilities (varint, kv-pairs)
 │   ├── messages/          # Control and data messages
@@ -78,7 +80,7 @@ python3 main.py
 ├── agent_gw/              # Business application code
 │   ├── arf_server.py      # ARF HTTP server (port 9001)
 │   ├── acf_server.py      # ACF WebSocket server (port 9002)
-│   ├── main.py            # Package entry point
+│   ├── main.py            # Internal application runner
 │   ├── models.py          # Database models
 │   └── logger_config.py   # Logging configuration
 ├── tests/                 # Test suite
@@ -98,10 +100,10 @@ python3 main.py
 
 ```bash
 # Start all services
-python3 main.py
+./start_agent_gw.sh
 
-# Alternative package entry point
-python -m agent_gw.main
+# Manual foreground start
+python3 agent_gw.py
 
 # Start individual services
 python -m agent_gw.arf_server    # ARF on port 9001

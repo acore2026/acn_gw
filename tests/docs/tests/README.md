@@ -7,10 +7,10 @@ Comprehensive test suite for the Agent GW backend application.
 From the repository root, start the full stack with:
 
 ```bash
-python3 main.py
+./start_agent_gw.sh
 ```
 
-The package entry point `python -m agent_gw.main` also works if you prefer it.
+The restartable background script `./start_agent_gw.sh` is the recommended start command.
 
 ## Test Structure
 

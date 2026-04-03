@@ -51,13 +51,12 @@ pytest --cov=. --cov-report=html --cov-report=term
 ### Running the Application
 ```bash
 # Start all services
-python3 main.py
+python3 agent_gw.py
 
 # Start individual services
 python -m agent_gw.arf_server      # ARF only (port 9001)
 python -m agent_gw.acf_server      # ACF only (port 9002)
-python3 main.py                    # Full stack including MOQT Relay
-python -m agent_gw.main            # Package entry point
+python3 agent_gw.py                # Full stack including MOQT Relay
 ```
 
 ### Linting
@@ -217,7 +216,7 @@ acn_gw/
 ├── models.py              # SQLAlchemy models (Agent, Task, Track)
 ├── arf_server.py          # ARF HTTP server
 ├── acf_server.py          # ACF WebSocket server
-├── main.py                # Repository entry point (runs all services)
+├── agent_gw.py           # Repository entry point (runs all services)
 ├── logger_config.py       # Logging configuration
 ├── run_tests.py           # Test runner script
 ├── requirements.txt       # Dependencies
