@@ -190,6 +190,34 @@ class TestACFMessageForwarding:
         assert sent_msg["payload"]["dst_agent_id"] == "dst-agent"
         assert sent_msg["payload"]["task_id"] == "task-002"
 
+    async def test_handle_discoveries_http_with_flat_payload(self, acf_server):
+        """Test flat discovery requests are forwarded to the destination agent."""
+        mock_ws = AsyncMock()
+        acf_server.connections["dst-agent-flat"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "src_agent_id": "src-agent-flat",
+            "dst_agent_id": "dst-agent-flat",
+            "task_id": "task-flat-002",
+            "task_description": "Collaboration task",
+            "agent_card": {
+                "agent_id": "src-agent-flat",
+                "skill": ["camera", "night_vision"]
+            },
+            "timestamp": "2025-01-01T00:00:00Z"
+        }
+
+        response = await acf_server.handle_discoveries(request)
+
+        assert response.status_code == 200
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+        assert sent_msg["type"] == "TASK_REQUEST_COLLABORATION"
+        assert sent_msg["payload"]["dst_agent_id"] == "dst-agent-flat"
+        assert sent_msg["payload"]["src_agent_id"] == "src-agent-flat"
+        assert sent_msg["payload"]["task_id"] == "task-flat-002"
+
     async def test_publish_track_persists_deduped_tracks(self, acf_server):
         """Test PUBLISH_TRACK stores deduplicated track metadata."""
         msg = {
@@ -307,6 +335,82 @@ class TestACFMessageForwarding:
         assert sent_msg["type"] == "SUBSCRIBE_TRACK"
         assert sent_msg["payload"]["task_id"] == "task-12345"
         assert len(sent_msg["payload"]["track_list"]) == 2
+
+    async def test_task_execution_subscribes_tracks_with_flat_payload(self, acf_server):
+        """Test flat task-execution payloads trigger SUBSCRIBE_TRACK."""
+        await acf_server.handle_publish_track({
+            "type": "PUBLISH_TRACK",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "payload": {
+                "src_agent_id": "did:acn:agent:222222222",
+                "task_id": "task-8717f",
+                "track_list": [
+                    {
+                        "namespace": "/task-8717f/did:acn:agent:222222222",
+                        "track": "Location"
+                    }
+                ]
+            }
+        })
+
+        mock_ws = AsyncMock()
+        acf_server.connections["did:acn:agent:target"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "agent_id": "did:acn:agent:target",
+            "task_id": "task-8717f",
+            "description": "声光驱离",
+            "timestamp": "2026-04-03T02:13:52Z"
+        }
+
+        response = await acf_server.handle_task_executions(request)
+
+        assert response.status_code == 200
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+        assert sent_msg["type"] == "SUBSCRIBE_TRACK"
+        assert sent_msg["payload"]["task_id"] == "task-8717f"
+        assert sent_msg["payload"]["track_list"] == [
+            {
+                "namespace": "/task-8717f/did:acn:agent:222222222",
+                "track": "Location"
+            }
+        ]
+
+    async def test_task_execution_logs_saved_tracks_when_mapping_missing(self, acf_server, caplog):
+        """Test missing track mapping logs saved track content for debugging."""
+        db = SessionLocal()
+        db.add(Track(
+            src_agent_id="did:acn:agent:existing",
+            task_id="task-existing",
+            track_list=[
+                {
+                    "namespace": "/task-existing/did:acn:agent:existing",
+                    "track": "Video"
+                }
+            ],
+        ))
+        db.commit()
+        db.close()
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "body": {
+                "agent_id": "did:acn:agent:222222222",
+                "task_id": None,
+                "description": "missing mapping",
+                "timestamp": "2025-01-01T00:00:00Z"
+            }
+        }
+
+        response = await acf_server.handle_task_executions(request)
+
+        assert response.status_code == 200
+        assert 'No track mapping found:' in caplog.text
+        assert '"task_id": null' in caplog.text
+        assert '"task_id": "task-existing"' in caplog.text
+        assert '"src_agent_id": "did:acn:agent:existing"' in caplog.text
 
     async def test_start_task_forwards_to_agent(self, acf_server):
         """Test START_TASK is forwarded to the destination agent."""
@@ -468,6 +572,41 @@ class TestACFMessageForwarding:
         assert db.query(Track).filter_by(src_agent_id="agent-delete-1").count() == 0
         assert db.query(Track).filter_by(src_agent_id="agent-delete-2").count() == 1
         db.close()
+
+    async def test_agent_deletions_with_flat_payload(self, acf_server):
+        """Test flat agent deletion requests remove local state and disconnect the agent."""
+        db = SessionLocal()
+        db.add(Agent(agent_id="agent-delete-flat", agent_status="online"))
+        db.add(Task(agent_id="agent-delete-flat", task_id="task-delete-flat", task_description="x"))
+        db.add(Track(
+            src_agent_id="agent-delete-flat",
+            task_id="task-delete-flat",
+            track_list=[{"namespace": "/task-delete-flat/agent-delete-flat", "track": "Video"}],
+        ))
+        db.commit()
+        db.close()
+
+        mock_ws = AsyncMock()
+        acf_server.connections["agent-delete-flat"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "agent_id": "agent-delete-flat",
+            "reason": "retired",
+            "timestamp": "2025-01-01T00:00:00Z",
+        }
+
+        response = await acf_server.handle_agent_deletions(request)
+
+        assert response.status_code == 200
+        mock_ws.close.assert_called_once()
+        assert "agent-delete-flat" not in acf_server.connections
+
+        db = SessionLocal()
+        assert db.query(Agent).filter_by(agent_id="agent-delete-flat").first() is None
+        assert db.query(Task).filter_by(agent_id="agent-delete-flat").count() == 0
+        assert db.query(Track).filter_by(src_agent_id="agent-delete-flat").count() == 0
+        db.close()
     
     async def test_forward_discover_result(self, acf_server):
         """Test forwarding DISCOVER_RESULT"""
@@ -527,6 +666,70 @@ class TestACFConnectionCleanup:
         agent = db.query(Agent).filter_by(agent_id="disconnecting-agent").first()
         assert agent.agent_status == "offline"
         db.close()
+
+    async def test_websocket_disconnect_clears_tasks_and_tracks(self, acf_server):
+        """Unexpected websocket closure should clear persisted task and track state."""
+        db = SessionLocal()
+        db.add(Agent(
+            agent_id="disconnecting-agent-2",
+            agent_status="online"
+        ))
+        db.add(Task(
+            agent_id="disconnecting-agent-2",
+            task_id="task-disconnect-1",
+            task_description="test task"
+        ))
+        db.add(Track(
+            src_agent_id="disconnecting-agent-2",
+            task_id="task-disconnect-1",
+            track_list=[
+                {
+                    "namespace": "/task-disconnect-1/disconnecting-agent-2",
+                    "track": "Video"
+                }
+            ]
+        ))
+        db.commit()
+        db.close()
+
+        messages = [json.dumps({"type": "SETUP", "payload": {"src_agent_id": "disconnecting-agent-2"}})]
+
+        class MockWebSocket:
+            def __init__(self, msgs):
+                self.messages = msgs
+                self.send_text = AsyncMock()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.messages:
+                    raise StopAsyncIteration
+                return self.messages.pop(0)
+
+        await acf_server.handle_websocket(MockWebSocket(messages), "/")
+
+        db = SessionLocal()
+        agent = db.query(Agent).filter_by(agent_id="disconnecting-agent-2").first()
+        assert agent is not None
+        assert agent.agent_status == "offline"
+        assert db.query(Task).filter_by(agent_id="disconnecting-agent-2").count() == 0
+        assert db.query(Track).filter_by(src_agent_id="disconnecting-agent-2").count() == 0
+        db.close()
+
+
+class TestACFWebSocketRoutes:
+    """Test registered websocket paths."""
+
+    def test_websocket_alias_ws_maps_to_same_endpoint(self, acf_server):
+        """Legacy /ws should remain accepted alongside /acf/ws."""
+        websocket_paths = {
+            route.path
+            for route in acf_server.app.routes
+            if getattr(route, 'path', None) in ('/acf/ws', '/ws')
+        }
+
+        assert websocket_paths == {'/acf/ws', '/ws'}
 
 @pytest.mark.asyncio
 class TestACFWebSocketHandler:

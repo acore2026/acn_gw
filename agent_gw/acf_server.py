@@ -32,6 +32,21 @@ def _log_message(direction, source, target, data):
     )
 
 
+def _serialize_track(track: Track):
+    """Build a compact log-friendly snapshot for a track row."""
+    return {
+        'src_agent_id': track.src_agent_id,
+        'task_id': track.task_id,
+        'track_list': track.track_list or [],
+    }
+
+
+def _get_request_body(data):
+    """Support both wrapped and flat request payloads."""
+    body = data.get('body')
+    return body if isinstance(body, dict) else data
+
+
 class ACFServer:
     def __init__(self, host='0.0.0.0', port=9002):
         self.host = host
@@ -44,6 +59,7 @@ class ACFServer:
         self.app.post('/clear')(self.handle_clear)
         self.app.post('/acn-agent/v1/agent-deletions')(self.handle_agent_deletions)
         self.app.websocket('/acf/ws')(self.websocket_endpoint)
+        self.app.websocket('/ws')(self.websocket_endpoint)
 
     async def _send_json(self, websocket, data, target=None):
         message = json.dumps(data)
@@ -62,14 +78,14 @@ class ACFServer:
 
             if msg_type == 'SETUP':
                 await self.handle_setup(websocket, data)
-                return data['payload']['src_agent_id']
+                return data['payload']['src_agent_id'], False
             elif msg_type == 'PUBLISH_TRACK':
                 await self.handle_publish_track(data)
             elif msg_type == 'START_TASK':
                 await self.handle_start_task(data)
             elif msg_type == 'DISCONNECTION':
                 await self.handle_disconnection(websocket, data, agent_id)
-                return None
+                return None, True
             elif msg_type == 'TASK_REQUEST_COLLABORATION':
                 await self.handle_task_request_collaboration(data)
             elif msg_type == 'TASK_ACCEPT_COLLABORATION':
@@ -85,25 +101,23 @@ class ACFServer:
         except Exception as e:
             acf_logger.info(f'Error processing message: {e}')
 
-        return agent_id
+        return agent_id, False
 
     async def handle_websocket(self, websocket, path=None):
         """Compatibility handler used by tests and legacy websocket flows."""
         agent_id = None
         try:
             async for message in websocket:
-                agent_id = await self._process_message(websocket, message, agent_id)
+                agent_id, should_disconnect = await self._process_message(
+                    websocket, message, agent_id
+                )
+                if should_disconnect:
+                    break
         except Exception as e:
             acf_logger.info(f'Error in websocket handler: {e}')
         finally:
-            if agent_id and agent_id in self.connections:
-                del self.connections[agent_id]
-                db = get_db()
-                agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
-                if agent:
-                    agent.agent_status = 'offline'
-                    db.commit()
-                db.close()
+            if agent_id:
+                self._cleanup_disconnected_agent_state(agent_id)
                 acf_logger.info(f'Agent {agent_id} disconnected')
 
     async def websocket_endpoint(self, websocket: WebSocket):
@@ -113,18 +127,16 @@ class ACFServer:
         try:
             while True:
                 message = await websocket.receive_text()
-                agent_id = await self._process_message(websocket, message, agent_id)
+                agent_id, should_disconnect = await self._process_message(
+                    websocket, message, agent_id
+                )
+                if should_disconnect:
+                    break
         except WebSocketDisconnect:
             pass
         finally:
-            if agent_id and agent_id in self.connections:
-                del self.connections[agent_id]
-                db = get_db()
-                agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
-                if agent:
-                    agent.agent_status = 'offline'
-                    db.commit()
-                db.close()
+            if agent_id:
+                self._cleanup_disconnected_agent_state(agent_id)
                 acf_logger.info(f'Agent {agent_id} disconnected')
 
     async def handle_setup(self, websocket, data):
@@ -155,7 +167,7 @@ class ACFServer:
         try:
             data = await request.json()
             _log_message('HTTP RECV', 'ARF', 'ACF /acf/v1/discoveries', data)
-            body = data.get('body', {})
+            body = _get_request_body(data)
             await self.forward_discovery(body)
             return JSONResponse(status_code=200, content={'status': 'OK'})
         except Exception as e:
@@ -172,7 +184,7 @@ class ACFServer:
                 'ACF /acn-agent/v1/task-executions',
                 data,
             )
-            body = data.get('body', {})
+            body = _get_request_body(data)
             task_id = body.get('task_id')
             agent_id = body.get('agent_id')
 
@@ -180,7 +192,17 @@ class ACFServer:
             try:
                 track_record = db.query(Track).filter(Track.task_id == task_id).first()
                 if not track_record:
-                    acf_logger.info(f'No track mapping found for task {task_id}')
+                    saved_tracks = db.query(Track).order_by(Track.task_id).all()
+                    task_execution_snapshot = {
+                        'task_id': task_id,
+                        'agent_id': agent_id,
+                        'request_body': body,
+                        'saved_tracks': [_serialize_track(track) for track in saved_tracks],
+                    }
+                    acf_logger.info(
+                        'No track mapping found: '
+                        f'{_format_log_payload(task_execution_snapshot)}'
+                    )
                     return JSONResponse(status_code=200, content={'status': 'OK'})
 
                 target_agent_id = agent_id
@@ -216,6 +238,7 @@ class ACFServer:
         try:
             data = await request.json()
             _log_message('HTTP RECV', 'ARF', 'ACF /clear', data)
+            _get_request_body(data)
             clear_msg = {
                 'type': 'CLEAR',
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
@@ -251,7 +274,8 @@ class ACFServer:
                 'ACF /acn-agent/v1/agent-deletions',
                 data,
             )
-            agent_id = data.get('agent_id')
+            body = _get_request_body(data)
+            agent_id = body.get('agent_id')
 
             if not agent_id:
                 acf_logger.info('agent-deletions request missing agent_id')
@@ -418,22 +442,7 @@ class ACFServer:
         if not target_agent_id:
             return
 
-        db = get_db()
-        try:
-            deleted_rows = db.query(Track).filter(
-                Track.src_agent_id == target_agent_id,
-            ).delete(synchronize_session=False)
-            db.commit()
-            acf_logger.info(
-                f'Deleted {deleted_rows} track rows for disconnected agent {target_agent_id}'
-            )
-        finally:
-            db.close()
-
-        if target_agent_id in self.connections:
-            del self.connections[target_agent_id]
-
-        self._mark_agent_offline(target_agent_id)
+        self._cleanup_disconnected_agent_state(target_agent_id)
 
     def _clear_local_state(self):
         """Remove all persisted ACF state."""
@@ -468,6 +477,29 @@ class ACFServer:
             db.commit()
         finally:
             db.close()
+
+    def _cleanup_disconnected_agent_state(self, agent_id):
+        """Remove transient state for a disconnected agent and mark it offline."""
+        db = get_db()
+        try:
+            deleted_track_rows = db.query(Track).filter(
+                Track.src_agent_id == agent_id
+            ).delete(synchronize_session=False)
+            deleted_task_rows = db.query(Task).filter(
+                Task.agent_id == agent_id
+            ).delete(synchronize_session=False)
+            agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+            if agent:
+                agent.agent_status = 'offline'
+            db.commit()
+        finally:
+            db.close()
+
+        self.connections.pop(agent_id, None)
+        acf_logger.info(
+            f'Cleared disconnected agent state for {agent_id}: '
+            f'tasks={deleted_task_rows}, tracks={deleted_track_rows}'
+        )
 
     async def _close_agent_connection(self, agent_id):
         """Close and remove a websocket connection if it exists."""

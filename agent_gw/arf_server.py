@@ -48,6 +48,50 @@ def _log_http_message(direction, source, target, data):
     )
 
 
+def _serialize_agent(agent: Agent):
+    """Build a compact log-friendly snapshot for an agent row."""
+    return {
+        'agent_id': agent.agent_id,
+        'agent_name': agent.agent_name,
+        'agent_status': agent.agent_status,
+        'agent_capability': agent.agent_capability or [],
+        'priority': agent.priority,
+    }
+
+
+def _get_agent_card_body(data):
+    """Support both wrapped and flat agent-card payloads."""
+    body = data.get('body')
+    return body if isinstance(body, dict) else data
+
+
+def _get_request_body(data):
+    """Support both wrapped and flat request payloads."""
+    body = data.get('body')
+    return body if isinstance(body, dict) else data
+
+
+def cleanup_dirty_data():
+    """Remove persisted rows that break discovery semantics."""
+    db = get_db()
+    try:
+        deleted_null_task_agents = db.query(Task).filter(
+            Task.agent_id.is_(None)
+        ).delete(synchronize_session=False)
+        db.commit()
+        arf_logger.info(
+            f'Initialization cleanup removed {deleted_null_task_agents} task rows with null agent_id'
+        )
+    finally:
+        db.close()
+
+
+@app.on_event('startup')
+async def startup_cleanup():
+    """Clean persisted dirty data before serving requests."""
+    cleanup_dirty_data()
+
+
 @app.post('/arf/v1/agent-cards')
 async def register_agent_card(request: Request):
     """Register agent card - receives agent credentials and validates with IDM."""
@@ -76,10 +120,11 @@ async def register_agent_card(request: Request):
             )
 
         agent_id = data.get('agent_id')
-        body = data.get('body', {})
+        body = _get_agent_card_body(data)
         vc_list = body.get('vc_list', [])
         agent_name = None
         capabilities = []
+        priority = body.get('priority', 0)
 
         for vc in vc_list:
             claims = vc.get('claims', {})
@@ -104,13 +149,14 @@ async def register_agent_card(request: Request):
             if existing_agent:
                 existing_agent.agent_name = agent_name
                 existing_agent.agent_capability = capabilities
+                existing_agent.priority = priority
             else:
                 new_agent = Agent(
                     agent_id=agent_id,
                     agent_name=agent_name,
                     agent_capability=capabilities,
                     agent_status='offline',
-                    priority=body.get('priority', 0),
+                    priority=priority,
                 )
                 db.add(new_agent)
 
@@ -131,7 +177,7 @@ async def discover_agents(request: Request):
     try:
         data = await request.json()
         _log_http_message('HTTP RECV', 'client', 'ARF /arf/v1/agent-discoveries', data)
-        body = data.get('body', {})
+        body = _get_request_body(data)
 
         requester_agent_id = body.get('agent_id')
         task_id = body.get('task_id')
@@ -160,7 +206,7 @@ async def handle_task_executions(request: Request):
             'ARF /acn-agent/v1/task-executions',
             data,
         )
-        body = data.get('body', {})
+        body = _get_request_body(data)
 
         agent_id = body.get('agent_id')
         task_id = body.get('task_id')
@@ -221,7 +267,7 @@ async def handle_task_execution_terminations(request: Request):
             'ARF /acn-agent/v1/task-execution-terminations',
             data,
         )
-        body = data.get('body', {})
+        body = _get_request_body(data)
 
         agent_id = body.get('agent_id')
         task_id = body.get('task_id')
@@ -264,7 +310,8 @@ async def handle_agent_deletions(request: Request):
             'ARF /acn-agent/v1/agent-deletions',
             data,
         )
-        agent_id = data.get('agent_id')
+        body = _get_request_body(data)
+        agent_id = body.get('agent_id')
 
         arf_logger.info(f'Received agent deletion for {agent_id}')
 
@@ -308,6 +355,7 @@ async def clear_environment(request: Request):
     try:
         data = await request.json()
         _log_http_message('HTTP RECV', 'client', 'ARF /clear', data)
+        _get_request_body(data)
         arf_logger.info('Received clear request')
 
         db = get_db()
@@ -370,7 +418,9 @@ async def process_discovery(
                 'required_capabilities': required_capabilities,
             },
         )
-        agents_in_tasks = db.query(Task.agent_id).distinct().all()
+        agents_in_tasks = db.query(Task.agent_id).filter(
+            Task.agent_id.isnot(None)
+        ).distinct().all()
         agents_in_tasks = [agent_id for (agent_id,) in agents_in_tasks]
 
         candidates = db.query(Agent).filter(
@@ -380,7 +430,18 @@ async def process_discovery(
         ).all()
 
         if not candidates:
-            arf_logger.info('No available agents found for discovery')
+            saved_agents = db.query(Agent).order_by(Agent.agent_id).all()
+            discovery_snapshot = {
+                'requester_agent_id': requester_agent_id,
+                'task_id': task_id,
+                'required_capabilities': required_capabilities,
+                'agents_in_tasks': agents_in_tasks,
+                'saved_agents': [_serialize_agent(agent) for agent in saved_agents],
+            }
+            arf_logger.info(
+                'No available agents found for discovery: '
+                f'{_format_log_payload(discovery_snapshot)}'
+            )
             return
 
         scored_agents = []
@@ -397,6 +458,9 @@ async def process_discovery(
 
         scored_agents.sort(key=lambda item: (-item[0].priority, -item[1]))
         selected_agent = scored_agents[0][0]
+        requester_agent = db.query(Agent).filter(
+            Agent.agent_id == requester_agent_id
+        ).first()
 
         arf_logger.info(f'Selected agent {selected_agent.agent_id} for collaboration')
 
@@ -407,13 +471,15 @@ async def process_discovery(
                 'Content-Type': 'application/json',
             },
             'body': {
-                'src_agent_id': 'ARF',
+                'src_agent_id': requester_agent_id,
                 'dst_agent_id': selected_agent.agent_id,
                 'task_id': task_id,
                 'task_description': 'Collaboration task',
                 'agent_card': {
-                    'agent_id': selected_agent.agent_id,
-                    'skill': selected_agent.agent_capability or [],
+                    'agent_id': requester_agent_id,
+                    'skill': (
+                        requester_agent.agent_capability if requester_agent else []
+                    ) or [],
                 },
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
             },
