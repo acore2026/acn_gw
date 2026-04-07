@@ -482,6 +482,51 @@ class TestAgentDiscovery:
         assert '"agent_status": "offline"' in caplog.text
 
 
+class TestAgentInfo:
+    """Test cases for POST /arf/v1/agent-info"""
+
+    def test_get_agent_info_returns_empty_when_agent_missing(self):
+        """Test agent-info returns empty object for unknown agent_id."""
+        payload = {
+            'body': {
+                'agent_id': 'did:acn:agent:not-found',
+            }
+        }
+
+        response = client.post('/arf/v1/agent-info', json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {}
+
+    def test_get_agent_info_returns_agent_details_for_flat_payload(self):
+        """Test agent-info returns stored agent details for flat payloads."""
+        db = SessionLocal()
+        db.add(Agent(
+            agent_id='did:acn:agent:111111',
+            agent_name='巡检机器人A',
+            agent_capability=['camera', 'monitoring', 'night_vision'],
+            agent_status='online',
+            priority=1,
+        ))
+        db.commit()
+        db.close()
+
+        payload = {
+            'agent_id': 'did:acn:agent:111111',
+        }
+
+        response = client.post('/arf/v1/agent-info', json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'agent_id': 'did:acn:agent:111111',
+            'agent_name': '巡检机器人A',
+            'agent_status': 'online',
+            'agent_capabilities': ['camera', 'monitoring', 'night_vision'],
+            'priority': 1,
+        }
+
+
 class TestInitializationCleanup:
     """Test startup dirty-data cleanup."""
 

@@ -59,6 +59,17 @@ def _serialize_agent(agent: Agent):
     }
 
 
+def _build_agent_info_response(agent: Agent):
+    """Build the /arf/v1/agent-info response payload."""
+    return {
+        'agent_id': agent.agent_id,
+        'agent_name': agent.agent_name,
+        'agent_status': agent.agent_status,
+        'agent_capabilities': agent.agent_capability or [],
+        'priority': agent.priority,
+    }
+
+
 def _get_agent_card_body(data):
     """Support both wrapped and flat agent-card payloads."""
     body = data.get('body')
@@ -192,6 +203,37 @@ async def discover_agents(request: Request):
         return JSONResponse(status_code=200, content={'status': 'OK'})
     except Exception as e:
         arf_logger.info(f'Error in discovery: {e}')
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/arf/v1/agent-info')
+async def get_agent_info(request: Request):
+    """Return locally stored agent info for the requested agent_id."""
+    try:
+        data = await request.json()
+        _log_http_message('HTTP RECV', 'client', 'ARF /arf/v1/agent-info', data)
+        body = _get_request_body(data)
+        agent_id = body.get('agent_id')
+
+        if not agent_id:
+            arf_logger.info('Agent info request missing agent_id')
+            return JSONResponse(status_code=200, content={})
+
+        db = get_db()
+        try:
+            agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+        finally:
+            db.close()
+
+        if not agent:
+            arf_logger.info(f'Agent info not found for {agent_id}')
+            return JSONResponse(status_code=200, content={})
+
+        response_payload = _build_agent_info_response(agent)
+        _log_http_message('HTTP SEND', 'ARF', 'client', response_payload)
+        return JSONResponse(status_code=200, content=response_payload)
+    except Exception as e:
+        arf_logger.info(f'Error getting agent info: {e}')
         raise HTTPException(status_code=500, detail=str(e))
 
 
