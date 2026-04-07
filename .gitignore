@@ -53,6 +53,9 @@ htmlcov/
 logs/
 *.log.*
 
+# Relay cache
+.relay_cache/
+
 # Certificates (self-signed)
 *.pem
 *.key
