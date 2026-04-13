@@ -8,7 +8,9 @@ Manages WebSocket connections for agents and discovery requests from ARF
 import asyncio
 import json
 from datetime import datetime
+from contextlib import suppress
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -47,12 +49,18 @@ def _get_request_body(data):
     return body if isinstance(body, dict) else data
 
 
+def _create_http_client():
+    """Create an HTTP client that ignores ambient proxy settings by default."""
+    return httpx.AsyncClient(trust_env=False)
+
+
 class ACFServer:
     def __init__(self, host='0.0.0.0', port=9002):
         self.host = host
         self.port = port
         self.connections = {}  # Map: agent_id -> websocket
         self.app = FastAPI(title='ACF - Agent Communication Function')
+        self.webui_subscribe_track_url = 'http://localhost:9005/ACN_v3/subscribe_track'
 
         self.app.post('/acf/v1/discoveries')(self.handle_discoveries)
         self.app.post('/acn-agent/v1/task-executions')(self.handle_task_executions)
@@ -219,6 +227,49 @@ class ACFServer:
                         'track_list': track_record.track_list or [],
                     },
                 }
+
+                http_subscribe_msg = {
+                    'method': 'POST',
+                    'url': '/ACN_v3/subscribe_track',
+                    'headers': {
+                        'Content-Type': 'application/json',
+                    },
+                    'body': {
+                        'type': 'SUBSCRIBE_TRACK',
+                        'timestamp': datetime.utcnow().isoformat() + 'Z',
+                        'payload': {
+                            'src_agent_id': 'ACF',
+                            'dst_agent_id': target_agent_id,
+                            'task_id': task_id,
+                            'track_list': track_record.track_list or [],
+                        },
+                    },
+                }
+
+                try:
+                    _log_message(
+                        'HTTP SEND',
+                        'ACF',
+                        self.webui_subscribe_track_url,
+                        http_subscribe_msg,
+                    )
+                    async with _create_http_client() as client:
+                        response = await client.post(
+                            self.webui_subscribe_track_url,
+                            json=http_subscribe_msg,
+                        )
+                    _log_message(
+                        'HTTP RECV',
+                        self.webui_subscribe_track_url,
+                        'ACF',
+                        {'status_code': response.status_code},
+                    )
+                    acf_logger.info(
+                        f'Forwarded SUBSCRIBE_TRACK HTTP message to webui for {target_agent_id}: {response.status_code}'
+                    )
+                except Exception as e:
+                    acf_logger.info(f'Error forwarding SUBSCRIBE_TRACK HTTP message: {e}')
+
                 await self._send_json(
                     self.connections[target_agent_id],
                     subscribe_msg,
@@ -553,7 +604,7 @@ class ACFServer:
         else:
             acf_logger.info(f'Destination agent {dst_agent_id} not connected for ROUTE message')
 
-    async def start(self):
+    async def start(self, stop_event: asyncio.Event | None = None):
         """Start the HTTP + websocket server."""
         config = uvicorn.Config(
             self.app,
@@ -562,7 +613,23 @@ class ACFServer:
             log_level='info',
         )
         server = uvicorn.Server(config)
-        await server.serve()
+        watcher = None
+        if stop_event is not None:
+            watcher = asyncio.create_task(self._watch_stop_event(stop_event, server))
+
+        try:
+            await server.serve()
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watcher
+            server.should_exit = True
+
+    async def _watch_stop_event(self, stop_event: asyncio.Event, server):
+        """Translate a shutdown event into a Uvicorn stop request."""
+        await stop_event.wait()
+        server.should_exit = True
 
 
 if __name__ == '__main__':

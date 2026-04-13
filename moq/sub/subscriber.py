@@ -15,8 +15,9 @@ from moq.messages import (
     FetchMessage, FetchOkMessage,
     ObjectStatus, StreamType, ErrorCode
 )
-from moq.encoding import FullTrackName, Location, VarInt
+from moq.encoding import FullTrackName, Location, VarInt, Parameters
 from moq.transport import QUICClient, StreamData, DatagramData
+from moq.session import SETUP_AGENT_ID_PARAM
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class MOQSubscriber:
         self._on_subscription_accepted = on_subscription_accepted
         self._on_subscription_rejected = on_subscription_rejected
     
-    async def connect(self) -> bool:
+    async def connect(self, agent_id: Optional[str] = None) -> bool:
         """Connect to relay."""
         logger.info(f"Connecting to relay at {self.relay_host}:{self.relay_port}")
         
@@ -105,7 +106,10 @@ class MOQSubscriber:
             self._session.set_send_callback(self._send_data)
             
             # Send SETUP
-            await self._session.send_setup(Role.SUBSCRIBER)
+            setup_params = Parameters()
+            if agent_id:
+                setup_params.set(SETUP_AGENT_ID_PARAM, agent_id.encode('utf-8'))
+            await self._session.send_setup(Role.SUBSCRIBER, parameters=setup_params)
             
             logger.info("Connected to relay")
             

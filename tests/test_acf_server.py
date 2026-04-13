@@ -292,7 +292,8 @@ class TestACFMessageForwarding:
         assert task_b.src_agent_id == "did:acn:agent:222222222"
         db.close()
 
-    async def test_task_execution_subscribes_tracks(self, acf_server):
+    @patch('agent_gw.acf_server.httpx.AsyncClient')
+    async def test_task_execution_subscribes_tracks(self, mock_async_client, acf_server):
         """Test task-execution notification triggers SUBSCRIBE_TRACK."""
         publish_msg = {
             "type": "PUBLISH_TRACK",
@@ -330,13 +331,31 @@ class TestACFMessageForwarding:
         response = await acf_server.handle_task_executions(request)
 
         assert response.status_code == 200
+        assert mock_async_client.return_value.__aenter__.called
         mock_ws.send_text.assert_called_once()
         sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
         assert sent_msg["type"] == "SUBSCRIBE_TRACK"
         assert sent_msg["payload"]["task_id"] == "task-12345"
         assert len(sent_msg["payload"]["track_list"]) == 2
+        http_client = mock_async_client.return_value.__aenter__.return_value
+        assert http_client.post.await_count == 1
+        _, kwargs = http_client.post.call_args
+        assert kwargs["json"]["url"] == "/ACN_v3/subscribe_track"
+        assert kwargs["json"]["body"]["type"] == "SUBSCRIBE_TRACK"
+        assert kwargs["json"]["body"]["payload"]["dst_agent_id"] == "did:acn:agent:222222222"
+        assert kwargs["json"]["body"]["payload"]["track_list"] == [
+            {
+                "namespace": "/task-12345/did:acn:agent:222222222",
+                "track": "Video"
+            },
+            {
+                "namespace": "/task-12345/did:acn:agent:222222222",
+                "track": "Location"
+            }
+        ]
 
-    async def test_task_execution_subscribes_tracks_with_flat_payload(self, acf_server):
+    @patch('agent_gw.acf_server.httpx.AsyncClient')
+    async def test_task_execution_subscribes_tracks_with_flat_payload(self, mock_async_client, acf_server):
         """Test flat task-execution payloads trigger SUBSCRIBE_TRACK."""
         await acf_server.handle_publish_track({
             "type": "PUBLISH_TRACK",
@@ -367,6 +386,11 @@ class TestACFMessageForwarding:
         response = await acf_server.handle_task_executions(request)
 
         assert response.status_code == 200
+        http_client = mock_async_client.return_value.__aenter__.return_value
+        assert http_client.post.await_count == 1
+        _, kwargs = http_client.post.call_args
+        assert kwargs["json"]["url"] == "/ACN_v3/subscribe_track"
+        assert kwargs["json"]["body"]["payload"]["dst_agent_id"] == "did:acn:agent:target"
         mock_ws.send_text.assert_called_once()
         sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
         assert sent_msg["type"] == "SUBSCRIBE_TRACK"

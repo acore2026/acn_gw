@@ -17,6 +17,9 @@ from moq.messages import (
 )
 from moq.encoding import FullTrackName, TrackAlias
 
+
+SETUP_AGENT_ID_PARAM = 0x1001
+
 logger = logging.getLogger(__name__)
 
 
@@ -255,13 +258,13 @@ class MOQSession:
         """Handle REQUEST_ERROR message."""
         logger.warning(f"Handling REQUEST_ERROR: request_id={msg.request_id}, code={msg.error_code}, reason={msg.reason}")
     
-    async def send_setup(self, role: Optional[Role] = None):
+    async def send_setup(self, role: Optional[Role] = None, parameters=None):
         """Send SETUP message."""
         if role is None:
             role = self.role
         
         from moq.encoding import Parameters
-        params = Parameters()
+        params = parameters if parameters is not None else Parameters()
         
         msg = SetupMessage(
             version=self.version,

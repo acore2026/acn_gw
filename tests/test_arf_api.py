@@ -78,6 +78,24 @@ class TestAgentCardRegistration:
         
         assert response.status_code == 200
         assert response.json()["status"] == "OK"
+        assert mock_client.post.await_count == 2
+        first_call = mock_client.post.await_args_list[0]
+        second_call = mock_client.post.await_args_list[1]
+        assert first_call.args[0] == "http://10.0.18.210:9020/idm/v1/vc-verifications"
+        assert second_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert second_call.kwargs["json"]["url"] == "/acn/v3/element-logs"
+        assert second_call.kwargs["json"]["body"]["element_id"] == "AgentGW"
+        assert second_call.kwargs["json"]["body"]["log_type"] == "PublishAgent"
+        assert second_call.kwargs["json"]["body"]["content"]["agent_id"] == "did:test:agent:001"
+        assert second_call.kwargs["json"]["body"]["content"]["agent_name"] == "Test Agent"
+        assert second_call.kwargs["json"]["body"]["content"]["agent_capability"] == ["Surveillance Camera"]
+        assert second_call.kwargs["json"]["body"]["content"]["agent_status"] == "offline"
+        assert second_call.kwargs["json"]["body"]["content"]["priority"] == 2
+        assert second_call.kwargs["json"]["body"]["content"]["consent"] == {
+            "need_consumer_ue_authorization": False,
+            "need_producer_authorization": True,
+            "support_producer_ue_authorization": False,
+        }
         
         # Verify agent was created in database
         db = SessionLocal()
@@ -129,6 +147,12 @@ class TestAgentCardRegistration:
 
         assert response.status_code == 200
         assert response.json()["status"] == "OK"
+        assert mock_client.post.await_count == 2
+        second_call = mock_client.post.await_args_list[1]
+        assert second_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert second_call.kwargs["json"]["body"]["content"]["agent_capability"] == ["6G业务开通", "声光驱离"]
+        assert second_call.kwargs["json"]["body"]["content"]["agent_status"] == "offline"
+        assert second_call.kwargs["json"]["body"]["content"]["priority"] == 4
 
         db = SessionLocal()
         agent = db.query(Agent).filter_by(

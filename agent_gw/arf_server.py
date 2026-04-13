@@ -22,6 +22,7 @@ from .models import Agent, Task, Track, get_db
 app = FastAPI(title='ARF - Agent Repository Function')
 
 IDM_URL = 'http://10.0.18.210:9020/idm/v1/vc-verifications'
+ELEMENT_LOGS_URL = 'http://localhost:9005/acn/v3/element-logs'
 ACF_DISCOVERIES_URL = 'http://localhost:9002/acf/v1/discoveries'
 ACF_TASK_EXECUTIONS_URL = 'http://localhost:9002/acn-agent/v1/task-executions'
 ACF_CLEAR_URL = 'http://localhost:9002/clear'
@@ -67,6 +68,40 @@ def _build_agent_info_response(agent: Agent):
         'agent_status': agent.agent_status,
         'agent_capabilities': agent.agent_capability or [],
         'priority': agent.priority,
+    }
+
+
+def _build_publish_agent_log_request(
+    agent_id: str,
+    agent_name: str,
+    agent_capabilities: list,
+    agent_status: str,
+    priority: int,
+):
+    """Build the element log request sent after agent registration."""
+    return {
+        'method': 'POST',
+        'url': '/acn/v3/element-logs',
+        'headers': {
+            'Content-Type': 'application/json',
+        },
+        'body': {
+            'element_id': 'AgentGW',
+            'log_type': 'PublishAgent',
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'content': {
+                'agent_name': agent_name,
+                'agent_id': agent_id,
+                'agent_capability': agent_capabilities,
+                'agent_status': agent_status,
+                'priority': priority,
+                'consent': {
+                    'need_consumer_ue_authorization': False,
+                    'need_producer_authorization': True,
+                    'support_producer_ue_authorization': False,
+                },
+            },
+        },
     }
 
 
@@ -161,6 +196,8 @@ async def register_agent_card(request: Request):
                 existing_agent.agent_name = agent_name
                 existing_agent.agent_capability = capabilities
                 existing_agent.priority = priority
+                existing_agent.agent_status = existing_agent.agent_status or 'offline'
+                agent_status = existing_agent.agent_status
             else:
                 new_agent = Agent(
                     agent_id=agent_id,
@@ -170,12 +207,37 @@ async def register_agent_card(request: Request):
                     priority=priority,
                 )
                 db.add(new_agent)
+                agent_status = 'offline'
 
             db.commit()
         finally:
             db.close()
 
         arf_logger.info(f'Agent {agent_id} registered with capabilities: {capabilities}')
+
+        try:
+            publish_agent_log = _build_publish_agent_log_request(
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_capabilities=capabilities,
+                agent_status=agent_status,
+                priority=priority,
+            )
+            async with _create_http_client() as client:
+                _log_http_message('HTTP SEND', 'ARF', ELEMENT_LOGS_URL, publish_agent_log)
+                response = await client.post(ELEMENT_LOGS_URL, json=publish_agent_log)
+                _log_http_message(
+                    'HTTP RECV',
+                    ELEMENT_LOGS_URL,
+                    'ARF',
+                    {'status_code': response.status_code},
+                )
+                arf_logger.info(
+                    f'Forwarded publish agent log for {agent_id}: {response.status_code}'
+                )
+        except Exception as e:
+            arf_logger.info(f'Error forwarding publish agent log: {e}')
+
         return JSONResponse(status_code=200, content={'status': 'OK'})
     except Exception as e:
         arf_logger.info(f'Error registering agent: {e}')

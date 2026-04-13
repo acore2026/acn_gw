@@ -4,14 +4,17 @@ Unit tests for the real MOQ relay implementation in moq/.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from moq import FullTrackName, Location
-from moq.relay import MOQRelay, CachedObject
+from moq.encoding import Parameters
+from moq.messages import SetupMessage
+from moq.relay import MOQRelay, CachedObject, ClientSession
+from moq.session import Role, SETUP_AGENT_ID_PARAM
 
 
 @pytest.fixture
@@ -64,3 +67,38 @@ class TestMOQRelayCache:
         fetched = relay.cache.get(track_name, Location(7, 3))
         assert fetched is not None
         assert fetched.payload == cached.payload
+
+
+class TestMOQRelaySetupLogging:
+    """Test MOQ SETUP handling and connection logging."""
+
+    @pytest.mark.asyncio
+    async def test_setup_with_agent_id_posts_element_log(self, relay):
+        params = Parameters()
+        params.set(SETUP_AGENT_ID_PARAM, b'did:acn:agent:987654321')
+        msg = SetupMessage(version=0xFF000011, role=Role.PUBLISHER.value, parameters=params)
+        client = ClientSession(
+            session_id='client-1',
+            protocol=MagicMock(),
+            quic_connection=MagicMock(),
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+
+        with patch('moq.relay.relay.httpx.AsyncClient') as mock_async_client:
+            mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            await relay._handle_setup(client, msg)
+
+        assert client.agent_id == 'did:acn:agent:987654321'
+        assert client.setup_logged is True
+        assert mock_client.post.await_count == 1
+        _, kwargs = mock_client.post.call_args
+        assert kwargs['json']['url'] == '/acn/v3/element-logs'
+        assert kwargs['json']['body']['element_id'] == 'AgentGW'
+        assert kwargs['json']['body']['log_type'] == 'SetupConnection'
+        assert kwargs['json']['body']['content']['agent_id'] == 'did:acn:agent:987654321'

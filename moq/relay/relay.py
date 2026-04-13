@@ -16,9 +16,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import threading
 
-from moq.session import MOQSession, Role, Subscription, Publication
+import httpx
+
+from moq.session import MOQSession, Role, Subscription, Publication, SETUP_AGENT_ID_PARAM
 from moq.messages import (
-    SubscribeMessage, PublishMessage, ObjectHeader, ObjectDatagram,
+    SetupMessage, SubscribeMessage, PublishMessage, ObjectHeader, ObjectDatagram,
     SubscribeOkMessage, PublishOkMessage, PublishDoneMessage,
     decode_control_message, GroupOrder, FetchMessage, FetchOkMessage,
     RequestErrorMessage, ErrorCode
@@ -27,6 +29,7 @@ from moq.encoding import FullTrackName, Location, VarInt
 from moq.transport import QUICServer, StreamData, DatagramData, is_quic_available
 
 logger = logging.getLogger(__name__)
+ELEMENT_LOGS_URL = "http://localhost:9005/acn/v3/element-logs"
 
 
 @dataclass
@@ -74,17 +77,24 @@ class ClientSession:
     session_id: str
     protocol: any  # MOQQuicProtocol instance
     quic_connection: any  # QuicConnection instance
+    agent_id: Optional[str] = None
     role: Optional[Role] = None
     subscriptions: Dict[FullTrackName, dict] = None
     publications: Dict[FullTrackName, dict] = None
     control_stream_id: Optional[int] = None
     control_buffer: bytes = b""
+    setup_logged: bool = False
     
     def __post_init__(self):
         if self.subscriptions is None:
             self.subscriptions = {}
         if self.publications is None:
             self.publications = {}
+
+
+def _create_http_client():
+    """Create an HTTP client that ignores ambient proxy settings by default."""
+    return httpx.AsyncClient(trust_env=False)
 
 
 class ObjectCache:
@@ -523,7 +533,9 @@ class MOQRelay:
 
     async def _dispatch_control_message(self, client: ClientSession, msg: object):
         """Dispatch a decoded control message."""
-        if isinstance(msg, PublishMessage):
+        if isinstance(msg, SetupMessage):
+            await self._handle_setup(client, msg)
+        elif isinstance(msg, PublishMessage):
             await self._handle_publish(client, msg)
         elif isinstance(msg, SubscribeMessage):
             await self._handle_subscribe(client, msg)
@@ -552,6 +564,67 @@ class MOQRelay:
         self._clients[session_id] = client
         logger.info(f"QUIC client registered lazily: {session_id}")
         return client
+
+    def _extract_agent_id_from_setup(self, msg: SetupMessage) -> Optional[str]:
+        """Read agent_id from optional SETUP parameters."""
+        if not msg.parameters:
+            return None
+
+        value = msg.parameters.get(SETUP_AGENT_ID_PARAM)
+        if isinstance(value, bytes):
+            try:
+                return value.decode('utf-8')
+            except UnicodeDecodeError:
+                logger.warning("Invalid UTF-8 agent_id in SETUP parameters")
+                return None
+        if isinstance(value, str):
+            return value
+        return None
+
+    def _build_setup_connection_log_request(self, agent_id: str):
+        """Build the element log request sent after MOQ connection setup."""
+        return {
+            'method': 'POST',
+            'url': '/acn/v3/element-logs',
+            'headers': {
+                'Content-Type': 'application/json',
+            },
+            'body': {
+                'element_id': 'AgentGW',
+                'log_type': 'SetupConnection',
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'content': {
+                    'agent_id': agent_id,
+                },
+            },
+        }
+
+    async def _handle_setup(self, client: ClientSession, msg: SetupMessage):
+        """Handle MOQ SETUP and emit a connection log once agent_id is known."""
+        agent_id = self._extract_agent_id_from_setup(msg)
+        if agent_id:
+            client.agent_id = agent_id
+        else:
+            logger.info(f"SETUP received without agent_id for client {client.session_id}")
+            return
+
+        if client.setup_logged:
+            return
+
+        try:
+            request_payload = self._build_setup_connection_log_request(agent_id)
+            logger.info(
+                f"HTTP SEND ARF -> {ELEMENT_LOGS_URL}: {json.dumps(request_payload, ensure_ascii=False, sort_keys=True)}"
+            )
+            async with _create_http_client() as http_client:
+                response = await http_client.post(ELEMENT_LOGS_URL, json=request_payload)
+                logger.info(
+                    f"HTTP RECV {ELEMENT_LOGS_URL} -> ARF: {json.dumps({'status_code': response.status_code}, ensure_ascii=False, sort_keys=True)}"
+                )
+            client.setup_logged = True
+            logger.info(f"Forwarded setup connection log for {agent_id}: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Failed to forward setup connection log for {agent_id}: {e}")
     
     async def _handle_publish(self, client: ClientSession, msg: PublishMessage):
         """Handle a publish request."""
