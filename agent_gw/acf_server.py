@@ -10,7 +10,6 @@ import json
 from datetime import datetime
 from contextlib import suppress
 
-import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -47,9 +46,24 @@ def _get_request_body(data):
     return body if isinstance(body, dict) else data
 
 
-def _create_http_client():
-    """Create an HTTP client that ignores ambient proxy settings by default."""
-    return httpx.AsyncClient(trust_env=False)
+def _merge_track_lists(track_records):
+    """Merge track lists from multiple publishing agents while preserving order."""
+    merged_tracks = []
+    seen = set()
+    for track_record in track_records:
+        for item in track_record.track_list or []:
+            namespace = item.get("namespace")
+            track = item.get("track")
+            key = (namespace, track)
+            if namespace and track and key not in seen:
+                seen.add(key)
+                merged_tracks.append(
+                    {
+                        "namespace": namespace,
+                        "track": track,
+                    }
+                )
+    return merged_tracks
 
 
 class ACFServer:
@@ -58,9 +72,6 @@ class ACFServer:
         self.port = port
         self.connections = {}  # Map: agent_id -> websocket
         self.app = FastAPI(title="ACF - Agent Communication Function")
-        self.webui_subscribe_track_url = (
-            "http://localhost:9005/api/acn/v3/subscribe_track"
-        )
 
         self.app.post("/acf/v1/discoveries")(self.handle_discoveries)
         self.app.post("/acn-agent/v1/task-executions")(self.handle_task_executions)
@@ -202,8 +213,10 @@ class ACFServer:
 
             db = get_db()
             try:
-                track_record = db.query(Track).filter(Track.task_id == task_id).first()
-                if not track_record:
+                track_records = db.query(Track).filter(
+                    Track.task_id == task_id,
+                ).order_by(Track.id).all()
+                if not track_records:
                     saved_tracks = db.query(Track).order_by(Track.task_id).all()
                     task_execution_snapshot = {
                         "task_id": task_id,
@@ -232,53 +245,9 @@ class ACFServer:
                     "payload": {
                         "src_agent_id": "ACF",
                         "task_id": task_id,
-                        "track_list": track_record.track_list or [],
+                        "track_list": _merge_track_lists(track_records),
                     },
                 }
-
-                http_subscribe_msg = {
-                    "method": "POST",
-                    "url": "/ACN_v3/subscribe_track",
-                    "headers": {
-                        "Content-Type": "application/json",
-                    },
-                    "body": {
-                        "type": "SUBSCRIBE_TRACK",
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                        "payload": {
-                            "src_agent_id": "ACF",
-                            "dst_agent_id": target_agent_id,
-                            "task_id": task_id,
-                            "track_list": track_record.track_list or [],
-                        },
-                    },
-                }
-
-                try:
-                    _log_message(
-                        "HTTP SEND",
-                        "ACF",
-                        self.webui_subscribe_track_url,
-                        http_subscribe_msg,
-                    )
-                    async with _create_http_client() as client:
-                        response = await client.post(
-                            self.webui_subscribe_track_url,
-                            json=http_subscribe_msg,
-                        )
-                    _log_message(
-                        "HTTP RECV",
-                        self.webui_subscribe_track_url,
-                        "ACF",
-                        {"status_code": response.status_code},
-                    )
-                    acf_logger.info(
-                        f"Forwarded SUBSCRIBE_TRACK HTTP message to webui for {target_agent_id}: {response.status_code}"
-                    )
-                except Exception as e:
-                    acf_logger.info(
-                        f"Error forwarding SUBSCRIBE_TRACK HTTP message: {e}"
-                    )
 
                 await self._send_json(
                     self.connections[target_agent_id],
@@ -490,7 +459,7 @@ class ACFServer:
             acf_logger.info(f"Destination agent {dst_agent_id} not connected")
 
     async def handle_publish_track(self, data):
-        """Persist track metadata for a single task_id with per-task dedupe."""
+        """Persist track metadata for one publishing agent within a task."""
         payload = data.get("payload", {})
         src_agent_id = payload.get("src_agent_id")
         task_id = payload.get("task_id")
@@ -498,6 +467,9 @@ class ACFServer:
 
         if not task_id:
             acf_logger.info("PUBLISH_TRACK missing task_id")
+            return
+        if not src_agent_id:
+            acf_logger.info("PUBLISH_TRACK missing src_agent_id")
             return
 
         deduped_tracks = []
@@ -517,7 +489,10 @@ class ACFServer:
 
         db = get_db()
         try:
-            existing_track = db.query(Track).filter(Track.task_id == task_id).first()
+            existing_track = db.query(Track).filter(
+                Track.task_id == task_id,
+                Track.src_agent_id == src_agent_id,
+            ).first()
             if existing_track and existing_track.track_list:
                 merged = existing_track.track_list + deduped_tracks
                 merged_deduped = []
@@ -552,48 +527,6 @@ class ACFServer:
             db.close()
 
         acf_logger.info(f"Persisted track metadata for task {task_id}")
-
-        http_subscribe_msg = {
-            "method": "POST",
-            "url": "/api/acn/v3/subscribe_track",
-            "headers": {
-                "Content-Type": "application/json",
-            },
-            "body": {
-                "type": "SUBSCRIBE_TRACK",
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "payload": {
-                    "src_agent_id": "ACF",
-                    "dst_agent_id": src_agent_id,
-                    "task_id": task_id,
-                    "track_list": deduped_tracks,
-                },
-            },
-        }
-
-        try:
-            _log_message(
-                "HTTP SEND",
-                "ACF",
-                self.webui_subscribe_track_url,
-                http_subscribe_msg,
-            )
-            async with _create_http_client() as client:
-                response = await client.post(
-                    self.webui_subscribe_track_url,
-                    json=http_subscribe_msg,
-                )
-            _log_message(
-                "HTTP RECV",
-                self.webui_subscribe_track_url,
-                "ACF",
-                {"status_code": response.status_code},
-            )
-            acf_logger.info(
-                f"Forwarded SUBSCRIBE_TRACK HTTP message to webui for {src_agent_id}: {response.status_code}"
-            )
-        except Exception as e:
-            acf_logger.info(f"Error forwarding SUBSCRIBE_TRACK HTTP message: {e}")
 
     async def handle_task_request_collaboration(self, data):
         """Forward TASK_REQUEST_COLLABORATION to destination agent."""

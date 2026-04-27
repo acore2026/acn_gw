@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Log directory
-LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 
@@ -24,7 +24,7 @@ def setup_logger(name: str, log_file: str, level=logging.INFO) -> logging.Logger
 
     Args:
         name: Logger name
-        log_file: Log file name (relative to agent_gw/logs/ directory)
+        log_file: Log file name (relative to repository logs/ directory)
         level: Logging level
 
     Returns:

@@ -7,7 +7,16 @@ Three functional entities:
 - MOQT Relay: MOQT protocol on port 9003
 """
 
-from sqlalchemy import create_engine, Column, String, Integer, JSON, ForeignKey, UniqueConstraint
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    Integer,
+    JSON,
+    ForeignKey,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
@@ -44,7 +53,11 @@ class Task(Base):
 class Track(Base):
     __tablename__ = 'tracks'
     __table_args__ = (
-        UniqueConstraint('task_id', name='uq_tracks_task_id'),
+        UniqueConstraint(
+            'task_id',
+            'src_agent_id',
+            name='uq_tracks_task_id_src_agent_id',
+        ),
     )
     
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -57,6 +70,48 @@ DB_PATH = Path(__file__).resolve().parent / 'agent_gw.db'
 engine = create_engine(f'sqlite:///{DB_PATH}', echo=False)
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
+
+
+def _tracks_has_legacy_task_unique(connection):
+    """Return True when tracks still has the old UNIQUE(task_id) constraint."""
+    indexes = connection.execute(text('PRAGMA index_list(tracks)')).fetchall()
+    for index in indexes:
+        is_unique = bool(index[2])
+        if not is_unique:
+            continue
+        columns = connection.execute(text(f'PRAGMA index_info("{index[1]}")')).fetchall()
+        column_names = [column[2] for column in columns]
+        if column_names == ['task_id']:
+            return True
+    return False
+
+
+def _migrate_tracks_unique_constraint():
+    """Migrate old tracks UNIQUE(task_id) schema to UNIQUE(task_id, src_agent_id)."""
+    with engine.begin() as connection:
+        if not _tracks_has_legacy_task_unique(connection):
+            return
+
+        connection.execute(text('ALTER TABLE tracks RENAME TO tracks_legacy_task_unique'))
+        connection.execute(text('''
+            CREATE TABLE tracks (
+                id INTEGER NOT NULL,
+                src_agent_id VARCHAR,
+                task_id VARCHAR,
+                track_list JSON,
+                PRIMARY KEY (id),
+                CONSTRAINT uq_tracks_task_id_src_agent_id UNIQUE (task_id, src_agent_id)
+            )
+        '''))
+        connection.execute(text('''
+            INSERT OR IGNORE INTO tracks (id, src_agent_id, task_id, track_list)
+            SELECT id, src_agent_id, task_id, track_list
+            FROM tracks_legacy_task_unique
+        '''))
+        connection.execute(text('DROP TABLE tracks_legacy_task_unique'))
+
+
+_migrate_tracks_unique_constraint()
 
 def get_db():
     return SessionLocal()

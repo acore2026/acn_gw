@@ -359,8 +359,64 @@ class TestACFMessageForwarding:
         assert task_b.src_agent_id == "did:acn:agent:222222222"
         db.close()
 
-    @patch('agent_gw.acf_server.httpx.AsyncClient')
-    async def test_task_execution_subscribes_tracks(self, mock_async_client, acf_server):
+    async def test_publish_track_keeps_agent_rows_per_task(self, acf_server):
+        """Test different agents publishing for one task keep separate track rows."""
+        messages = [
+            {
+                "type": "PUBLISH_TRACK",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "payload": {
+                    "src_agent_id": "did:acn:agent:camera",
+                    "task_id": "task-shared",
+                    "track_list": [
+                        {
+                            "namespace": "/task-shared/did:acn:agent:camera",
+                            "track": "Video",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "PUBLISH_TRACK",
+                "timestamp": "2025-01-01T00:00:01Z",
+                "payload": {
+                    "src_agent_id": "did:acn:agent:location",
+                    "task_id": "task-shared",
+                    "track_list": [
+                        {
+                            "namespace": "/task-shared/did:acn:agent:location",
+                            "track": "Location",
+                        }
+                    ],
+                },
+            },
+        ]
+
+        for message in messages:
+            await acf_server.handle_publish_track(message)
+
+        db = SessionLocal()
+        tracks = db.query(Track).filter_by(task_id="task-shared").all()
+        by_agent = {track.src_agent_id: track.track_list for track in tracks}
+        assert set(by_agent) == {
+            "did:acn:agent:camera",
+            "did:acn:agent:location",
+        }
+        assert by_agent["did:acn:agent:camera"] == [
+            {
+                "namespace": "/task-shared/did:acn:agent:camera",
+                "track": "Video",
+            }
+        ]
+        assert by_agent["did:acn:agent:location"] == [
+            {
+                "namespace": "/task-shared/did:acn:agent:location",
+                "track": "Location",
+            }
+        ]
+        db.close()
+
+    async def test_task_execution_subscribes_tracks(self, acf_server):
         """Test task-execution notification triggers SUBSCRIBE_TRACK."""
         publish_msg = {
             "type": "PUBLISH_TRACK",
@@ -398,19 +454,12 @@ class TestACFMessageForwarding:
         response = await acf_server.handle_task_executions(request)
 
         assert response.status_code == 200
-        assert mock_async_client.return_value.__aenter__.called
         mock_ws.send_text.assert_called_once()
         sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
         assert sent_msg["type"] == "SUBSCRIBE_TRACK"
         assert sent_msg["payload"]["task_id"] == "task-12345"
         assert len(sent_msg["payload"]["track_list"]) == 2
-        http_client = mock_async_client.return_value.__aenter__.return_value
-        assert http_client.post.await_count == 1
-        _, kwargs = http_client.post.call_args
-        assert kwargs["json"]["url"] == "/ACN_v3/subscribe_track"
-        assert kwargs["json"]["body"]["type"] == "SUBSCRIBE_TRACK"
-        assert kwargs["json"]["body"]["payload"]["dst_agent_id"] == "did:acn:agent:222222222"
-        assert kwargs["json"]["body"]["payload"]["track_list"] == [
+        assert sent_msg["payload"]["track_list"] == [
             {
                 "namespace": "/task-12345/did:acn:agent:222222222",
                 "track": "Video"
@@ -421,8 +470,7 @@ class TestACFMessageForwarding:
             }
         ]
 
-    @patch('agent_gw.acf_server.httpx.AsyncClient')
-    async def test_task_execution_subscribes_tracks_with_flat_payload(self, mock_async_client, acf_server):
+    async def test_task_execution_subscribes_tracks_with_flat_payload(self, acf_server):
         """Test flat task-execution payloads trigger SUBSCRIBE_TRACK."""
         await acf_server.handle_publish_track({
             "type": "PUBLISH_TRACK",
@@ -453,11 +501,6 @@ class TestACFMessageForwarding:
         response = await acf_server.handle_task_executions(request)
 
         assert response.status_code == 200
-        http_client = mock_async_client.return_value.__aenter__.return_value
-        assert http_client.post.await_count == 1
-        _, kwargs = http_client.post.call_args
-        assert kwargs["json"]["url"] == "/ACN_v3/subscribe_track"
-        assert kwargs["json"]["body"]["payload"]["dst_agent_id"] == "did:acn:agent:target"
         mock_ws.send_text.assert_called_once()
         sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
         assert sent_msg["type"] == "SUBSCRIBE_TRACK"
@@ -467,6 +510,72 @@ class TestACFMessageForwarding:
                 "namespace": "/task-8717f/did:acn:agent:222222222",
                 "track": "Location"
             }
+        ]
+
+    async def test_task_execution_subscribes_all_agent_tracks_for_task(self, acf_server):
+        """Test SUBSCRIBE_TRACK includes tracks from all publishers for a task."""
+        publish_messages = [
+            {
+                "type": "PUBLISH_TRACK",
+                "timestamp": "2025-01-01T00:00:00Z",
+                "payload": {
+                    "src_agent_id": "did:acn:agent:camera",
+                    "task_id": "task-multi-agent",
+                    "track_list": [
+                        {
+                            "namespace": "/task-multi-agent/did:acn:agent:camera",
+                            "track": "Video",
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "PUBLISH_TRACK",
+                "timestamp": "2025-01-01T00:00:01Z",
+                "payload": {
+                    "src_agent_id": "did:acn:agent:location",
+                    "task_id": "task-multi-agent",
+                    "track_list": [
+                        {
+                            "namespace": "/task-multi-agent/did:acn:agent:location",
+                            "track": "Location",
+                        }
+                    ],
+                },
+            },
+        ]
+        for publish_message in publish_messages:
+            await acf_server.handle_publish_track(publish_message)
+
+        mock_ws = AsyncMock()
+        acf_server.connections["did:acn:agent:target"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "body": {
+                "agent_id": "did:acn:agent:target",
+                "task_id": "task-multi-agent",
+                "description": "多 agent track 订阅",
+                "timestamp": "2025-01-01T00:00:02Z",
+            }
+        }
+
+        response = await acf_server.handle_task_executions(request)
+
+        assert response.status_code == 200
+        mock_ws.send_text.assert_called_once()
+        sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+        assert sent_msg["type"] == "SUBSCRIBE_TRACK"
+        assert sent_msg["payload"]["task_id"] == "task-multi-agent"
+        assert sent_msg["payload"]["track_list"] == [
+            {
+                "namespace": "/task-multi-agent/did:acn:agent:camera",
+                "track": "Video",
+            },
+            {
+                "namespace": "/task-multi-agent/did:acn:agent:location",
+                "track": "Location",
+            },
         ]
 
     async def test_task_execution_logs_saved_tracks_when_mapping_missing(self, acf_server, caplog):
