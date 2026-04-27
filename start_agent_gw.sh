@@ -6,7 +6,6 @@ set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PID_FILE="$SCRIPT_DIR/.agent_gw.pid"
-LOG_FILE="$SCRIPT_DIR/.agent_gw.log"
 
 cd "$SCRIPT_DIR"
 
@@ -30,9 +29,20 @@ fi
 rm -f "$PID_FILE"
 
 echo "Starting Agent GW in background..."
-nohup python3 agent_gw.py > "$LOG_FILE" 2>&1 &
+# Set environment variable to disable console output (avoid duplication)
+# Logger will detect this and only write to files
+export AGENT_GW_NO_CONSOLE=1
+nohup python3 agent_gw.py > /dev/null 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 
 echo "Agent GW started with PID: $NEW_PID"
-echo "Log file: $LOG_FILE"
+echo "Log files:"
+echo "  - Main log:  $SCRIPT_DIR/logs/agent_gw.log"
+echo "  - ARF log:   $SCRIPT_DIR/logs/arf.log"
+echo "  - ACF log:   $SCRIPT_DIR/logs/acf.log"
+echo "  - MOQT log:  $SCRIPT_DIR/logs/moqt.log"
+echo ""
+echo "View logs with: tail -f $SCRIPT_DIR/logs/*.log"
+echo ""
+echo "Or run 'python3 agent_gw.py' directly for console output."
