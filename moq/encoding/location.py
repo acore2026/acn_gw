@@ -129,16 +129,6 @@ class FullTrackName:
     def __hash__(self):
         return hash((tuple(self.namespace), self.track_name))
     
-    def normalize(self) -> 'FullTrackName':
-        """
-        Normalize the full track name by removing empty namespace fields.
-        This ensures consistent comparison between track names that may have
-        been constructed differently (e.g., with/without leading/trailing slashes).
-        """
-        # Filter out empty namespace fields
-        normalized_namespace = [field for field in self.namespace if len(field) > 0]
-        return FullTrackName(normalized_namespace, self.track_name)
-    
     def __repr__(self):
         ns_str = '/'.join(f.decode('utf-8', errors='replace') for f in self.namespace)
         name_str = self.track_name.decode('utf-8', errors='replace')

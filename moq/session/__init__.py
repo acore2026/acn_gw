@@ -9,8 +9,7 @@ from .session import (
     SessionState,
     Subscription,
     Publication,
-    FetchRequest,
-    SETUP_AGENT_ID_PARAM,
+    FetchRequest
 )
 
 __all__ = [
@@ -20,5 +19,4 @@ __all__ = [
     'Subscription',
     'Publication',
     'FetchRequest',
-    'SETUP_AGENT_ID_PARAM',
 ]

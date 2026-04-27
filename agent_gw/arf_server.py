@@ -105,6 +105,49 @@ def _build_publish_agent_log_request(
     }
 
 
+def _build_task_execution_log_request(body):
+    """Build the element log request sent after task execution starts."""
+    return {
+        "method": "POST",
+        "url": "/acn/v3/element-logs",
+        "headers": {
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "element_id": "AgentGW",
+            "log_type": "TaskExecution",
+            "timestamp": body.get("timestamp", datetime.utcnow().isoformat() + "Z"),
+            "content": {
+                "agent_id": body.get("agent_id"),
+                "task_id": body.get("task_id"),
+                "task_description": body.get("description"),
+            },
+        },
+    }
+
+
+def _build_task_execution_termination_log_request(body):
+    """Build the element log request sent after task execution terminates."""
+    return {
+        "method": "POST",
+        "url": "/acn/v3/element-logs",
+        "headers": {
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "element_id": "AgentGW",
+            "log_type": "TaskExecutionTermination",
+            "timestamp": body.get("timestamp", datetime.utcnow().isoformat() + "Z"),
+            "content": {
+                "agent_id": body.get("agent_id"),
+                "task_id": body.get("task_id"),
+                "reason": body.get("reason"),
+                "force": body.get("force"),
+            },
+        },
+    }
+
+
 def _get_agent_card_body(data):
     """Support both wrapped and flat agent-card payloads."""
     body = data.get("body")
@@ -368,6 +411,25 @@ async def handle_task_executions(request: Request):
         except Exception as e:
             arf_logger.info(f"Error forwarding task execution to ACF: {e}")
 
+        try:
+            task_execution_log = _build_task_execution_log_request(body)
+            async with _create_http_client() as client:
+                _log_http_message(
+                    "HTTP SEND", "ARF", ELEMENT_LOGS_URL, task_execution_log
+                )
+                response = await client.post(ELEMENT_LOGS_URL, json=task_execution_log)
+                _log_http_message(
+                    "HTTP RECV",
+                    ELEMENT_LOGS_URL,
+                    "ARF",
+                    {"status_code": response.status_code},
+                )
+                arf_logger.info(
+                    f"Forwarded task execution log for {agent_id}: {response.status_code}"
+                )
+        except Exception as e:
+            arf_logger.info(f"Error forwarding task execution log: {e}")
+
         return JSONResponse(status_code=200, content={"status": "OK"})
     except Exception as e:
         arf_logger.info(f"Error handling task execution: {e}")
@@ -414,6 +476,28 @@ async def handle_task_execution_terminations(request: Request):
                 )
         finally:
             db.close()
+
+        try:
+            task_termination_log = _build_task_execution_termination_log_request(body)
+            async with _create_http_client() as client:
+                _log_http_message(
+                    "HTTP SEND", "ARF", ELEMENT_LOGS_URL, task_termination_log
+                )
+                response = await client.post(
+                    ELEMENT_LOGS_URL,
+                    json=task_termination_log,
+                )
+                _log_http_message(
+                    "HTTP RECV",
+                    ELEMENT_LOGS_URL,
+                    "ARF",
+                    {"status_code": response.status_code},
+                )
+                arf_logger.info(
+                    f"Forwarded task execution termination log for {agent_id}: {response.status_code}"
+                )
+        except Exception as e:
+            arf_logger.info(f"Error forwarding task execution termination log: {e}")
 
         return JSONResponse(status_code=200, content={"status": "OK"})
     except Exception as e:

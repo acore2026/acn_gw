@@ -218,6 +218,73 @@ class TestACFMessageForwarding:
         assert sent_msg["payload"]["src_agent_id"] == "src-agent-flat"
         assert sent_msg["payload"]["task_id"] == "task-flat-002"
 
+    async def test_handle_task_assigned_http_forwards_to_assigned_agents(self, acf_server):
+        """Test HTTP TASK_ASSIGNED requests are forwarded to assigned agents."""
+        mock_ws_1 = AsyncMock()
+        mock_ws_2 = AsyncMock()
+        acf_server.connections["did:acn:agent:2222222"] = mock_ws_1
+        acf_server.connections["did:acn:agent:33333333"] = mock_ws_2
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "type": "TASK_ASSIGNED",
+            "timestamp": "2026-04-24T00:00:00Z",
+            "payload": {
+                "task_description": "危险区域协同巡检",
+                "assigned_agents": [
+                    "did:acn:agent:2222222",
+                    "did:acn:agent:33333333",
+                ],
+            },
+        }
+
+        response = await acf_server.handle_task_assigned(request)
+
+        assert response.status_code == 200
+        response_body = json.loads(response.body)
+        assert response_body["sent_agents"] == [
+            "did:acn:agent:2222222",
+            "did:acn:agent:33333333",
+        ]
+        assert response_body["missing_agents"] == []
+
+        for mock_ws in (mock_ws_1, mock_ws_2):
+            mock_ws.send_text.assert_called_once()
+            sent_msg = json.loads(mock_ws.send_text.call_args[0][0])
+            assert sent_msg["type"] == "TASK_ASSIGNED"
+            assert sent_msg["timestamp"] == "2026-04-24T00:00:00Z"
+            assert sent_msg["payload"]["task_description"] == "危险区域协同巡检"
+            assert sent_msg["payload"]["assigned_agents"] == [
+                "did:acn:agent:2222222",
+                "did:acn:agent:33333333",
+            ]
+
+    async def test_handle_task_assigned_http_skips_disconnected_agents(self, acf_server):
+        """Test TASK_ASSIGNED reports assigned agents without open websocket sessions."""
+        mock_ws = AsyncMock()
+        acf_server.connections["did:acn:agent:2222222"] = mock_ws
+
+        request = AsyncMock()
+        request.json.return_value = {
+            "type": "TASK_ASSIGNED",
+            "timestamp": "2026-04-24T00:00:00Z",
+            "payload": {
+                "task_description": "危险区域协同巡检",
+                "assigned_agents": [
+                    "did:acn:agent:2222222",
+                    "did:acn:agent:33333333",
+                ],
+            },
+        }
+
+        response = await acf_server.handle_task_assigned(request)
+
+        assert response.status_code == 200
+        response_body = json.loads(response.body)
+        assert response_body["sent_agents"] == ["did:acn:agent:2222222"]
+        assert response_body["missing_agents"] == ["did:acn:agent:33333333"]
+        mock_ws.send_text.assert_called_once()
+
     async def test_publish_track_persists_deduped_tracks(self, acf_server):
         """Test PUBLISH_TRACK stores deduplicated track metadata."""
         msg = {
@@ -754,6 +821,20 @@ class TestACFWebSocketRoutes:
         }
 
         assert websocket_paths == {'/acf/ws', '/ws'}
+
+
+class TestACFHttpRoutes:
+    """Test registered HTTP paths."""
+
+    def test_task_assigned_route_is_registered(self, acf_server):
+        """ACN SDK callback path should be available on the ACF HTTP server."""
+        http_paths = {
+            route.path
+            for route in acf_server.app.routes
+            if "POST" in getattr(route, "methods", set())
+        }
+
+        assert "/acn/v3/task-assigned" in http_paths
 
 @pytest.mark.asyncio
 class TestACFWebSocketHandler:

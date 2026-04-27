@@ -3,6 +3,7 @@
 Unit tests for ARF HTTP API
 """
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 import sys
@@ -15,12 +16,26 @@ from agent_gw.arf_server import (
     cleanup_dirty_data,
     process_discovery,
     clear_environment,
+    handle_task_executions,
+    handle_task_execution_terminations,
     handle_agent_deletions,
 )
 from agent_gw.models import Agent, Task, Track, SessionLocal
 
 # Create test client
 client = TestClient(app)
+
+
+def _configure_mock_async_client(mock_async_client):
+    """Configure a patched httpx.AsyncClient with a successful post response."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+    return mock_client
+
 
 class TestAgentCardRegistration:
     """Test cases for POST /arf/v1/agent-cards"""
@@ -583,7 +598,8 @@ class TestInitializationCleanup:
 class TestTaskExecution:
     """Test cases for task execution lifecycle endpoints"""
 
-    def test_task_execution_creates_record(self):
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    def test_task_execution_creates_record(self, mock_async_client):
         """Test creating a task execution record."""
         db = SessionLocal()
         agent = Agent(
@@ -604,7 +620,10 @@ class TestTaskExecution:
             }
         }
 
-        response = client.post("/acn-agent/v1/task-executions", json=payload)
+        _configure_mock_async_client(mock_async_client)
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_executions(request))
 
         assert response.status_code == 200
         db = SessionLocal()
@@ -613,7 +632,8 @@ class TestTaskExecution:
         assert task.task_description == "危险区域可以人员巡检"
         db.close()
 
-    def test_task_execution_creates_record_with_flat_payload(self):
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    def test_task_execution_creates_record_with_flat_payload(self, mock_async_client):
         """Test creating a task execution record from flat payloads."""
         db = SessionLocal()
         agent = Agent(
@@ -632,7 +652,10 @@ class TestTaskExecution:
             "timestamp": "2024-03-23T12:00:00Z",
         }
 
-        response = client.post("/acn-agent/v1/task-executions", json=payload)
+        _configure_mock_async_client(mock_async_client)
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_executions(request))
 
         assert response.status_code == 200
         db = SessionLocal()
@@ -673,13 +696,28 @@ class TestTaskExecution:
             }
         }
 
-        response = client.post("/acn-agent/v1/task-executions", json=payload)
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_executions(request))
 
         assert response.status_code == 200
-        assert mock_client.post.await_count == 1
-        _, kwargs = mock_client.post.call_args
-        assert kwargs["json"]["body"]["task_id"] == "task-exec-forward"
-        assert kwargs["json"]["body"]["agent_id"] == "did:acn:agent:exec-forward"
+        assert mock_client.post.await_count == 2
+        acf_call = mock_client.post.await_args_list[0]
+        element_log_call = mock_client.post.await_args_list[1]
+        assert acf_call.args[0] == "http://localhost:9002/acn-agent/v1/task-executions"
+        assert acf_call.kwargs["json"]["body"]["task_id"] == "task-exec-forward"
+        assert acf_call.kwargs["json"]["body"]["agent_id"] == "did:acn:agent:exec-forward"
+        assert element_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = element_log_call.kwargs["json"]
+        assert element_log["url"] == "/acn/v3/element-logs"
+        assert element_log["body"]["element_id"] == "AgentGW"
+        assert element_log["body"]["log_type"] == "TaskExecution"
+        assert element_log["body"]["timestamp"] == "2024-03-23T12:00:00Z"
+        assert element_log["body"]["content"] == {
+            "agent_id": "did:acn:agent:exec-forward",
+            "task_id": "task-exec-forward",
+            "task_description": "Forward this task execution",
+        }
 
 
 class TestEnvironmentReset:
@@ -872,7 +910,8 @@ class TestEnvironmentReset:
         assert db.query(Task).filter_by(agent_id="did:acn:agent:delete-002").count() == 0
         db.close()
 
-    def test_task_execution_updates_existing_record(self):
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    def test_task_execution_updates_existing_record(self, mock_async_client):
         """Test that repeated task execution updates the existing record."""
         db = SessionLocal()
         agent = Agent(
@@ -900,7 +939,10 @@ class TestEnvironmentReset:
             }
         }
 
-        response = client.post("/acn-agent/v1/task-executions", json=payload)
+        _configure_mock_async_client(mock_async_client)
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_executions(request))
 
         assert response.status_code == 200
         db = SessionLocal()
@@ -909,7 +951,8 @@ class TestEnvironmentReset:
         assert tasks[0].task_description == "New description"
         db.close()
 
-    def test_task_execution_termination_deletes_record(self):
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    def test_task_execution_termination_deletes_record(self, mock_async_client):
         """Test removing a task record when execution terminates."""
         db = SessionLocal()
         agent = Agent(
@@ -938,7 +981,10 @@ class TestEnvironmentReset:
             }
         }
 
-        response = client.post("/acn-agent/v1/task-execution-terminations", json=payload)
+        _configure_mock_async_client(mock_async_client)
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_execution_terminations(request))
 
         assert response.status_code == 200
         db = SessionLocal()
@@ -946,7 +992,8 @@ class TestEnvironmentReset:
         assert task is None
         db.close()
 
-    def test_task_execution_termination_deletes_record_with_flat_payload(self):
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    def test_task_execution_termination_deletes_record_with_flat_payload(self, mock_async_client):
         """Test removing a task record when termination payload is flat."""
         db = SessionLocal()
         agent = Agent(
@@ -973,7 +1020,10 @@ class TestEnvironmentReset:
             "force": "false",
         }
 
-        response = client.post("/acn-agent/v1/task-execution-terminations", json=payload)
+        _configure_mock_async_client(mock_async_client)
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_execution_terminations(request))
 
         assert response.status_code == 200
         db = SessionLocal()
@@ -983,6 +1033,60 @@ class TestEnvironmentReset:
         ).first()
         assert task is None
         db.close()
+
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    def test_task_execution_termination_forwards_element_log(self, mock_async_client):
+        """Test task execution termination is forwarded to element logs."""
+        db = SessionLocal()
+        db.add(Agent(
+            agent_id="did:acn:agent:exec-log-termination",
+            agent_name="Termination Logger",
+            agent_status="online",
+        ))
+        db.add(Task(
+            agent_id="did:acn:agent:exec-log-termination",
+            task_id="task-exec-log-termination",
+            task_description="Terminate with log",
+        ))
+        db.commit()
+        db.close()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        payload = {
+            "body": {
+                "agent_id": "did:acn:agent:exec-log-termination",
+                "task_id": "task-exec-log-termination",
+                "reason": "目标已离开区域，任务完成",
+                "timestamp": "2024-03-23T12:00:00Z",
+                "force": "false",
+            }
+        }
+
+        request = AsyncMock()
+        request.json.return_value = payload
+        response = asyncio.run(handle_task_execution_terminations(request))
+
+        assert response.status_code == 200
+        assert mock_client.post.await_count == 1
+        element_log_call = mock_client.post.await_args_list[0]
+        assert element_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = element_log_call.kwargs["json"]
+        assert element_log["url"] == "/acn/v3/element-logs"
+        assert element_log["body"]["element_id"] == "AgentGW"
+        assert element_log["body"]["log_type"] == "TaskExecutionTermination"
+        assert element_log["body"]["timestamp"] == "2024-03-23T12:00:00Z"
+        assert element_log["body"]["content"] == {
+            "agent_id": "did:acn:agent:exec-log-termination",
+            "task_id": "task-exec-log-termination",
+            "reason": "目标已离开区域，任务完成",
+            "force": "false",
+        }
 
 class TestErrorHandling:
     """Test error handling scenarios"""

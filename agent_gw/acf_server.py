@@ -64,6 +64,7 @@ class ACFServer:
 
         self.app.post("/acf/v1/discoveries")(self.handle_discoveries)
         self.app.post("/acn-agent/v1/task-executions")(self.handle_task_executions)
+        self.app.post("/acn/v3/task-assigned")(self.handle_task_assigned)
         self.app.post("/acf/v1/task-termination")(self.handle_task_termination)
         self.app.post("/clear")(self.handle_clear)
         self.app.post("/acn-agent/v1/agent-deletions")(self.handle_agent_deletions)
@@ -291,6 +292,65 @@ class ACFServer:
             return JSONResponse(status_code=200, content={"status": "OK"})
         except Exception as e:
             acf_logger.info(f"Error handling task execution message: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def handle_task_assigned(self, request: Request):
+        """Forward TASK_ASSIGNED HTTP notifications to assigned agents."""
+        try:
+            data = await request.json()
+            _log_message(
+                "HTTP RECV",
+                "ACN",
+                "ACF /acn/v3/task-assigned",
+                data,
+            )
+            body = _get_request_body(data)
+            payload = body.get("payload", {})
+
+            if not isinstance(payload, dict):
+                acf_logger.info("TASK_ASSIGNED request payload must be an object")
+                return JSONResponse(status_code=200, content={"status": "OK"})
+
+            assigned_agents = payload.get("assigned_agents", [])
+            if not isinstance(assigned_agents, list):
+                acf_logger.info("TASK_ASSIGNED request missing assigned_agents list")
+                return JSONResponse(status_code=200, content={"status": "OK"})
+
+            message = {
+                "type": body.get("type", "TASK_ASSIGNED"),
+                "timestamp": body.get("timestamp", datetime.utcnow().isoformat() + "Z"),
+                "payload": payload,
+            }
+
+            sent_agents = []
+            missing_agents = []
+            for agent_id in assigned_agents:
+                websocket = self.connections.get(agent_id)
+                if not websocket:
+                    missing_agents.append(agent_id)
+                    acf_logger.info(
+                        f"Assigned agent {agent_id} not connected for TASK_ASSIGNED"
+                    )
+                    continue
+
+                try:
+                    await self._send_json(websocket, message, target=agent_id)
+                    sent_agents.append(agent_id)
+                    acf_logger.info(f"Forwarded TASK_ASSIGNED to {agent_id}")
+                except Exception as e:
+                    missing_agents.append(agent_id)
+                    acf_logger.info(f"Error sending TASK_ASSIGNED to {agent_id}: {e}")
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "OK",
+                    "sent_agents": sent_agents,
+                    "missing_agents": missing_agents,
+                },
+            )
+        except Exception as e:
+            acf_logger.info(f"Error handling task assigned message: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     async def handle_task_termination(self, request: Request):
