@@ -26,8 +26,16 @@ def acf_server():
 class TestACFSetup:
     """Test SETUP message handling"""
     
-    async def test_handle_setup_new_agent(self, acf_server):
+    @patch("agent_gw.acf_server.httpx.AsyncClient")
+    async def test_handle_setup_new_agent(self, mock_async_client, acf_server):
         """Test SETUP message for new agent"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
         # Mock WebSocket
         mock_ws = AsyncMock()
         
@@ -68,6 +76,14 @@ class TestACFSetup:
         response = json.loads(mock_ws.send_text.call_args[0][0])
         assert response["type"] == "SETUP"
         assert response["payload"]["status"] == "OK"
+
+        mock_client.post.assert_awaited_once()
+        args, kwargs = mock_client.post.call_args
+        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = kwargs["json"]
+        assert element_log["body"]["log_type"] == "PublishAgent"
+        assert element_log["body"]["content"]["agent_id"] == "did:acn:agent:test001"
+        assert element_log["body"]["content"]["agent_status"] == "online"
     
     async def test_handle_setup_duplicate_connection(self, acf_server):
         """Test SETUP message when agent already connected"""
@@ -323,6 +339,57 @@ class TestACFMessageForwarding:
             ("/task-12345/did:acn:agent:222222222", "Location"),
         }
         db.close()
+
+    @patch("agent_gw.acf_server.httpx.AsyncClient")
+    async def test_publish_track_sends_publisher_track_add_log(
+        self,
+        mock_async_client,
+        acf_server,
+    ):
+        """Test PUBLISH_TRACK reports PublisherTrackAdd after persisting."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        await acf_server.handle_publish_track({
+            "type": "PUBLISH_TRACK",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "payload": {
+                "src_agent_id": "did:acn:agent:publisher",
+                "task_id": "task-publisher-log",
+                "track_list": [
+                    {
+                        "namespace": "/task-publisher-log/did:acn:agent:publisher",
+                        "track": "Video",
+                    },
+                    {
+                        "namespace": "/task-publisher-log/did:acn:agent:publisher",
+                        "track": "Video",
+                    },
+                ],
+            },
+        })
+
+        mock_client.post.assert_awaited_once()
+        args, kwargs = mock_client.post.call_args
+        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = kwargs["json"]
+        assert element_log["url"] == "/acn/v3/element-logs"
+        assert element_log["body"]["element_id"] == "AgentGW"
+        assert element_log["body"]["log_type"] == "PublisherTrackAdd"
+        assert element_log["body"]["content"] == {
+            "src_agent_id": "did:acn:agent:publisher",
+            "task_id": "task-publisher-log",
+            "track_list": [
+                {
+                    "namespace": "/task-publisher-log/did:acn:agent:publisher",
+                    "track": "Video",
+                }
+            ],
+        }
 
     async def test_publish_track_dedupes_per_task_only(self, acf_server):
         """Test identical track items are preserved across different task_ids."""
@@ -772,6 +839,100 @@ class TestACFMessageForwarding:
         assert db.query(Track).filter_by(src_agent_id="agent-delete-1").count() == 0
         assert db.query(Track).filter_by(src_agent_id="agent-delete-2").count() == 1
         db.close()
+
+    @patch("agent_gw.acf_server.httpx.AsyncClient")
+    async def test_agent_deletions_sends_publisher_track_del_log(
+        self,
+        mock_async_client,
+        acf_server,
+    ):
+        """Test deleting an agent reports PublisherTrackDel for its track rows."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        db = SessionLocal()
+        db.add(Agent(agent_id="agent-delete-log", agent_status="online"))
+        db.add(Track(
+            src_agent_id="agent-delete-log",
+            task_id="task-delete-log",
+            track_list=[{"namespace": "/task-delete-log/agent-delete-log", "track": "Video"}],
+        ))
+        db.commit()
+        db.close()
+
+        request = AsyncMock()
+        request.json.return_value = {"agent_id": "agent-delete-log"}
+
+        response = await acf_server.handle_agent_deletions(request)
+
+        assert response.status_code == 200
+        assert mock_client.post.await_count == 2
+        args, kwargs = mock_client.post.await_args_list[0]
+        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = kwargs["json"]
+        assert element_log["body"]["log_type"] == "PublisherTrackDel"
+        assert element_log["body"]["content"] == {
+            "src_agent_id": "agent-delete-log",
+            "task_id": "task-delete-log",
+            "track_list": [
+                {"namespace": "/task-delete-log/agent-delete-log", "track": "Video"}
+            ],
+        }
+        args, kwargs = mock_client.post.await_args_list[1]
+        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = kwargs["json"]
+        assert element_log["body"]["log_type"] == "DeleteAgent"
+        assert element_log["body"]["content"]["agent_id"] == "agent-delete-log"
+
+    @patch("agent_gw.acf_server.httpx.AsyncClient")
+    async def test_agent_deletions_sends_task_execution_termination_log(
+        self,
+        mock_async_client,
+        acf_server,
+    ):
+        """Test deleting an agent reports TaskExecutionTermination for task rows."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        db = SessionLocal()
+        db.add(Agent(agent_id="agent-task-delete-log", agent_status="online"))
+        db.add(Task(
+            agent_id="agent-task-delete-log",
+            task_id="task-delete-log",
+            task_description="Task delete log",
+        ))
+        db.commit()
+        db.close()
+
+        request = AsyncMock()
+        request.json.return_value = {"agent_id": "agent-task-delete-log"}
+
+        response = await acf_server.handle_agent_deletions(request)
+
+        assert response.status_code == 200
+        assert mock_client.post.await_count == 2
+        args, kwargs = mock_client.post.await_args_list[0]
+        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = kwargs["json"]
+        assert element_log["body"]["log_type"] == "TaskExecutionTermination"
+        assert element_log["body"]["content"] == {
+            "agent_id": "agent-task-delete-log",
+            "task_id": "task-delete-log",
+            "task_description": "Task delete log",
+        }
+        args, kwargs = mock_client.post.await_args_list[1]
+        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        element_log = kwargs["json"]
+        assert element_log["body"]["log_type"] == "DeleteAgent"
+        assert element_log["body"]["content"]["agent_id"] == "agent-task-delete-log"
 
     async def test_agent_deletions_with_flat_payload(self, acf_server):
         """Test flat agent deletion requests remove local state and disconnect the agent."""

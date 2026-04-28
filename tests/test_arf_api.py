@@ -702,8 +702,8 @@ class TestTaskExecution:
 
         assert response.status_code == 200
         assert mock_client.post.await_count == 2
-        acf_call = mock_client.post.await_args_list[0]
-        element_log_call = mock_client.post.await_args_list[1]
+        element_log_call = mock_client.post.await_args_list[0]
+        acf_call = mock_client.post.await_args_list[1]
         assert acf_call.args[0] == "http://localhost:9002/acn-agent/v1/task-executions"
         assert acf_call.kwargs["json"]["body"]["task_id"] == "task-exec-forward"
         assert acf_call.kwargs["json"]["body"]["agent_id"] == "did:acn:agent:exec-forward"
@@ -712,7 +712,6 @@ class TestTaskExecution:
         assert element_log["url"] == "/acn/v3/element-logs"
         assert element_log["body"]["element_id"] == "AgentGW"
         assert element_log["body"]["log_type"] == "TaskExecution"
-        assert element_log["body"]["timestamp"] == "2024-03-23T12:00:00Z"
         assert element_log["body"]["content"] == {
             "agent_id": "did:acn:agent:exec-forward",
             "task_id": "task-exec-forward",
@@ -762,9 +761,31 @@ class TestEnvironmentReset:
         response = await clear_environment(request)
 
         assert response.status_code == 200
-        assert mock_client.post.await_count == 1
-        _, kwargs = mock_client.post.call_args
-        assert kwargs["json"]["url"] == "/clear"
+        assert mock_client.post.await_count == 5
+        task_log_call = mock_client.post.await_args_list[0]
+        agent_log_call = mock_client.post.await_args_list[1]
+        track_log_call = mock_client.post.await_args_list[2]
+        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
+        assert task_log_call.kwargs["json"]["body"]["content"] == {
+            "agent_id": "did:acn:agent:clear-001",
+            "task_id": "task-clear-001",
+            "task_description": "Clear task",
+        }
+        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
+        assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
+            "did:acn:agent:clear-001"
+        )
+        assert track_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert track_log_call.kwargs["json"]["body"]["log_type"] == "PublisherTrackDel"
+        assert track_log_call.kwargs["json"]["body"]["content"] == {
+            "src_agent_id": "did:acn:agent:clear-001",
+            "task_id": "task-clear-001",
+            "track_list": [{"namespace": "/task-clear-001/agent", "track": "Video"}],
+        }
+        assert mock_client.post.await_args_list[3].kwargs["json"]["url"] == "/clear"
+        assert mock_client.post.await_args_list[4].kwargs["json"]["url"] == "/clear"
 
         db = SessionLocal()
         assert db.query(Agent).count() == 0
@@ -808,7 +829,31 @@ class TestEnvironmentReset:
         response = await clear_environment(request)
 
         assert response.status_code == 200
-        assert mock_client.post.await_count == 1
+        assert mock_client.post.await_count == 5
+        task_log_call = mock_client.post.await_args_list[0]
+        agent_log_call = mock_client.post.await_args_list[1]
+        track_log_call = mock_client.post.await_args_list[2]
+        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
+        assert task_log_call.kwargs["json"]["body"]["content"] == {
+            "agent_id": "did:acn:agent:clear-flat-001",
+            "task_id": "task-clear-flat-001",
+            "task_description": "Clear flat task",
+        }
+        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
+        assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
+            "did:acn:agent:clear-flat-001"
+        )
+        assert track_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert track_log_call.kwargs["json"]["body"]["log_type"] == "PublisherTrackDel"
+        assert track_log_call.kwargs["json"]["body"]["content"] == {
+            "src_agent_id": "did:acn:agent:clear-flat-001",
+            "task_id": "task-clear-flat-001",
+            "track_list": [
+                {"namespace": "/task-clear-flat-001/agent", "track": "Video"}
+            ],
+        }
 
         db = SessionLocal()
         assert db.query(Agent).count() == 0
@@ -857,9 +902,23 @@ class TestEnvironmentReset:
         response = await handle_agent_deletions(request)
 
         assert response.status_code == 200
-        assert mock_client.post.await_count == 1
-        _, kwargs = mock_client.post.call_args
-        assert kwargs["json"]["agent_id"] == "did:acn:agent:delete-001"
+        assert mock_client.post.await_count == 3
+        task_log_call = mock_client.post.await_args_list[0]
+        agent_log_call = mock_client.post.await_args_list[1]
+        forward_call = mock_client.post.await_args_list[2]
+        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
+        assert task_log_call.kwargs["json"]["body"]["content"] == {
+            "agent_id": "did:acn:agent:delete-001",
+            "task_id": "task-delete-001",
+            "task_description": "Delete task",
+        }
+        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
+        assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
+            "did:acn:agent:delete-001"
+        )
+        assert forward_call.kwargs["json"]["agent_id"] == "did:acn:agent:delete-001"
 
         db = SessionLocal()
         assert db.query(Agent).filter_by(agent_id="did:acn:agent:delete-001").first() is None
@@ -903,7 +962,21 @@ class TestEnvironmentReset:
         response = await handle_agent_deletions(request)
 
         assert response.status_code == 200
-        assert mock_client.post.await_count == 1
+        assert mock_client.post.await_count == 3
+        task_log_call = mock_client.post.await_args_list[0]
+        agent_log_call = mock_client.post.await_args_list[1]
+        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
+        assert task_log_call.kwargs["json"]["body"]["content"] == {
+            "agent_id": "did:acn:agent:delete-002",
+            "task_id": "task-delete-002",
+            "task_description": "Delete task wrapped",
+        }
+        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
+        assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
+            "did:acn:agent:delete-002"
+        )
 
         db = SessionLocal()
         assert db.query(Agent).filter_by(agent_id="did:acn:agent:delete-002").first() is None
@@ -1080,12 +1153,10 @@ class TestEnvironmentReset:
         assert element_log["url"] == "/acn/v3/element-logs"
         assert element_log["body"]["element_id"] == "AgentGW"
         assert element_log["body"]["log_type"] == "TaskExecutionTermination"
-        assert element_log["body"]["timestamp"] == "2024-03-23T12:00:00Z"
         assert element_log["body"]["content"] == {
             "agent_id": "did:acn:agent:exec-log-termination",
             "task_id": "task-exec-log-termination",
-            "reason": "目标已离开区域，任务完成",
-            "force": "false",
+            "task_description": "Terminate with log",
         }
 
 class TestErrorHandling:

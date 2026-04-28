@@ -10,12 +10,20 @@ import json
 from datetime import datetime
 from contextlib import suppress
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .logger_config import acf_logger
 from .models import Agent, Task, Track, get_db
+
+ELEMENT_LOGS_URL = "http://localhost:9005/acn/v3/element-logs"
+
+
+def _create_http_client():
+    """Create an HTTP client that ignores ambient proxy settings by default."""
+    return httpx.AsyncClient(trust_env=False, timeout=0.2)
 
 
 def _format_log_payload(data):
@@ -37,6 +45,90 @@ def _serialize_track(track: Track):
         "src_agent_id": track.src_agent_id,
         "task_id": track.task_id,
         "track_list": track.track_list or [],
+    }
+
+
+def _serialize_task(task: Task):
+    """Build a compact snapshot for a task row."""
+    return {
+        "agent_id": task.agent_id,
+        "task_id": task.task_id,
+        "task_description": task.task_description,
+    }
+
+
+def _serialize_agent_log(agent: Agent):
+    """Build the element-log content for an agent row."""
+    return {
+        "agent_name": agent.agent_name,
+        "agent_id": agent.agent_id,
+        "agent_capability": agent.agent_capability or [],
+        "agent_status": agent.agent_status,
+        "priority": agent.priority,
+        "consent": {
+            "need_consumer_ue_authorization": False,
+            "need_producer_authorization": True,
+            "support_producer_ue_authorization": False,
+        },
+    }
+
+
+def _build_agent_log_request(log_type, agent_snapshot):
+    """Build a PublishAgent/DeleteAgent element log request."""
+    return {
+        "method": "POST",
+        "url": "/acn/v3/element-logs",
+        "headers": {
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "element_id": "AgentGW",
+            "log_type": log_type,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "content": agent_snapshot,
+        },
+    }
+
+
+def _build_publisher_track_log_request(log_type, track_snapshot):
+    """Build a PublisherTrackAdd/PublisherTrackDel element log request."""
+    return {
+        "method": "POST",
+        "url": "/acn/v3/element-logs",
+        "headers": {
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "element_id": "AgentGW",
+            "log_type": log_type,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "content": {
+                "src_agent_id": track_snapshot["src_agent_id"],
+                "task_id": track_snapshot["task_id"],
+                "track_list": track_snapshot["track_list"],
+            },
+        },
+    }
+
+
+def _build_task_log_request(log_type, task_snapshot):
+    """Build a TaskExecution/TaskExecutionTermination element log request."""
+    return {
+        "method": "POST",
+        "url": "/acn/v3/element-logs",
+        "headers": {
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "element_id": "AgentGW",
+            "log_type": log_type,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "content": {
+                "agent_id": task_snapshot["agent_id"],
+                "task_id": task_snapshot["task_id"],
+                "task_description": task_snapshot["task_description"],
+            },
+        },
     }
 
 
@@ -90,6 +182,87 @@ class ACFServer:
         else:
             await websocket.send(message)
 
+    async def _send_publisher_track_log(self, log_type, track_snapshot):
+        """Send a publisher track element log without failing the main flow."""
+        log_request = _build_publisher_track_log_request(log_type, track_snapshot)
+        try:
+            async with _create_http_client() as client:
+                _log_message("HTTP SEND", "ACF", ELEMENT_LOGS_URL, log_request)
+                response = await client.post(ELEMENT_LOGS_URL, json=log_request)
+                _log_message(
+                    "HTTP RECV",
+                    ELEMENT_LOGS_URL,
+                    "ACF",
+                    {"status_code": response.status_code},
+                )
+                acf_logger.info(
+                    f"Sent {log_type} for task={track_snapshot['task_id']} "
+                    f"src_agent_id={track_snapshot['src_agent_id']}: "
+                    f"{response.status_code}"
+                )
+        except Exception as e:
+            acf_logger.info(
+                f"Error sending {log_type} for task={track_snapshot['task_id']} "
+                f"src_agent_id={track_snapshot['src_agent_id']}: {e}"
+            )
+
+    async def _send_publisher_track_del_logs(self, track_snapshots):
+        for track_snapshot in track_snapshots:
+            await self._send_publisher_track_log("PublisherTrackDel", track_snapshot)
+
+    async def _send_agent_log(self, log_type, agent_snapshot):
+        """Send an agent table element log without failing the main flow."""
+        agent_log = _build_agent_log_request(log_type, agent_snapshot)
+        try:
+            async with _create_http_client() as client:
+                _log_message("HTTP SEND", "ACF", ELEMENT_LOGS_URL, agent_log)
+                response = await client.post(ELEMENT_LOGS_URL, json=agent_log)
+                _log_message(
+                    "HTTP RECV",
+                    ELEMENT_LOGS_URL,
+                    "ACF",
+                    {"status_code": response.status_code},
+                )
+                acf_logger.info(
+                    f"Sent {log_type} for agent_id={agent_snapshot['agent_id']}: "
+                    f"{response.status_code}"
+                )
+        except Exception as e:
+            acf_logger.info(
+                f"Error sending {log_type} for agent_id={agent_snapshot['agent_id']}: {e}"
+            )
+
+    async def _send_agent_del_logs(self, agent_snapshots):
+        for agent_snapshot in agent_snapshots:
+            await self._send_agent_log("DeleteAgent", agent_snapshot)
+
+    async def _send_task_log(self, log_type, task_snapshot):
+        """Send a task lifecycle element log without failing the main flow."""
+        task_log = _build_task_log_request(log_type, task_snapshot)
+        try:
+            async with _create_http_client() as client:
+                _log_message("HTTP SEND", "ACF", ELEMENT_LOGS_URL, task_log)
+                response = await client.post(ELEMENT_LOGS_URL, json=task_log)
+                _log_message(
+                    "HTTP RECV",
+                    ELEMENT_LOGS_URL,
+                    "ACF",
+                    {"status_code": response.status_code},
+                )
+                acf_logger.info(
+                    f"Sent {log_type} for task={task_snapshot['task_id']} "
+                    f"agent_id={task_snapshot['agent_id']}: {response.status_code}"
+                )
+        except Exception as e:
+            acf_logger.info(
+                f"Error sending {log_type} for task={task_snapshot['task_id']} "
+                f"agent_id={task_snapshot['agent_id']}: {e}"
+            )
+
+    async def _send_task_del_logs(self, task_snapshots):
+        for task_snapshot in task_snapshots:
+            await self._send_task_log("TaskExecutionTermination", task_snapshot)
+
     async def _process_message(self, websocket, message, agent_id=None):
         try:
             data = json.loads(message)
@@ -140,7 +313,7 @@ class ACFServer:
             acf_logger.info(f"Error in websocket handler: {e}")
         finally:
             if agent_id:
-                self._cleanup_disconnected_agent_state(agent_id)
+                await self._cleanup_disconnected_agent_state(agent_id)
                 acf_logger.info(f"Agent {agent_id} disconnected")
 
     async def websocket_endpoint(self, websocket: WebSocket):
@@ -159,7 +332,7 @@ class ACFServer:
             pass
         finally:
             if agent_id:
-                self._cleanup_disconnected_agent_state(agent_id)
+                await self._cleanup_disconnected_agent_state(agent_id)
                 acf_logger.info(f"Agent {agent_id} disconnected")
 
     async def handle_setup(self, websocket, data):
@@ -168,11 +341,18 @@ class ACFServer:
         self.connections[agent_id] = websocket
 
         db = get_db()
-        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
-        if agent:
-            agent.agent_status = "online"
-            db.commit()
-        db.close()
+        agent_snapshot = None
+        try:
+            agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
+            if agent:
+                agent.agent_status = "online"
+                agent_snapshot = _serialize_agent_log(agent)
+                db.commit()
+        finally:
+            db.close()
+
+        if agent_snapshot:
+            await self._send_agent_log("PublishAgent", agent_snapshot)
 
         acf_logger.info(f"Agent {agent_id} connected and status set to online")
 
@@ -343,6 +523,10 @@ class ACFServer:
 
             db = get_db()
             try:
+                track_snapshots = [
+                    _serialize_track(track)
+                    for track in db.query(Track).filter(Track.task_id == task_id).all()
+                ]
                 db.query(Track).filter(Track.task_id == task_id).delete(
                     synchronize_session=False
                 )
@@ -350,6 +534,8 @@ class ACFServer:
                 acf_logger.info(f"Deleted track records for task_id={task_id}")
             finally:
                 db.close()
+
+            await self._send_publisher_track_del_logs(track_snapshots)
 
             termination_msg = {
                 "type": "TASK_TERMINATION",
@@ -403,7 +589,7 @@ class ACFServer:
                         await websocket.close()
 
             self.connections.clear()
-            self._clear_local_state()
+            await self._clear_local_state()
             acf_logger.info("ACF state cleared")
             return JSONResponse(status_code=200, content={"status": "OK"})
         except Exception as e:
@@ -427,7 +613,7 @@ class ACFServer:
                 acf_logger.info("agent-deletions request missing agent_id")
                 return JSONResponse(status_code=200, content={"status": "OK"})
 
-            self._remove_agent_state(agent_id)
+            await self._remove_agent_state(agent_id)
             await self._close_agent_connection(agent_id)
             acf_logger.info(f"Agent deletion handled for {agent_id}")
             return JSONResponse(status_code=200, content={"status": "OK"})
@@ -488,6 +674,7 @@ class ACFServer:
                 )
 
         db = get_db()
+        track_snapshot = None
         try:
             existing_track = db.query(Track).filter(
                 Track.task_id == task_id,
@@ -511,21 +698,24 @@ class ACFServer:
                         )
                 existing_track.track_list = merged_deduped
                 existing_track.src_agent_id = src_agent_id
+                track_snapshot = _serialize_track(existing_track)
             elif existing_track:
                 existing_track.track_list = deduped_tracks
                 existing_track.src_agent_id = src_agent_id
+                track_snapshot = _serialize_track(existing_track)
             else:
-                db.add(
-                    Track(
-                        src_agent_id=src_agent_id,
-                        task_id=task_id,
-                        track_list=deduped_tracks,
-                    )
+                new_track = Track(
+                    src_agent_id=src_agent_id,
+                    task_id=task_id,
+                    track_list=deduped_tracks,
                 )
+                db.add(new_track)
+                track_snapshot = _serialize_track(new_track)
             db.commit()
         finally:
             db.close()
 
+        await self._send_publisher_track_log("PublisherTrackAdd", track_snapshot)
         acf_logger.info(f"Persisted track metadata for task {task_id}")
 
     async def handle_task_request_collaboration(self, data):
@@ -602,12 +792,24 @@ class ACFServer:
         if not target_agent_id:
             return
 
-        self._cleanup_disconnected_agent_state(target_agent_id)
+        await self._cleanup_disconnected_agent_state(target_agent_id)
 
-    def _clear_local_state(self):
+    async def _clear_local_state(self):
         """Remove all persisted ACF state."""
         db = get_db()
         try:
+            track_snapshots = [
+                _serialize_track(track)
+                for track in db.query(Track).filter(Track.id.isnot(None)).all()
+            ]
+            agent_snapshots = [
+                _serialize_agent_log(agent)
+                for agent in db.query(Agent).filter(Agent.agent_id.isnot(None)).all()
+            ]
+            task_snapshots = [
+                _serialize_task(task)
+                for task in db.query(Task).filter(Task.id.isnot(None)).all()
+            ]
             db.query(Track).filter(Track.id.isnot(None)).delete(
                 synchronize_session=False
             )
@@ -619,10 +821,26 @@ class ACFServer:
         finally:
             db.close()
 
-    def _remove_agent_state(self, agent_id):
+        await self._send_task_del_logs(task_snapshots)
+        await self._send_publisher_track_del_logs(track_snapshots)
+        await self._send_agent_del_logs(agent_snapshots)
+
+    async def _remove_agent_state(self, agent_id):
         """Remove all persisted rows for a single agent."""
         db = get_db()
         try:
+            track_snapshots = [
+                _serialize_track(track)
+                for track in db.query(Track).filter(Track.src_agent_id == agent_id).all()
+            ]
+            agent_snapshots = [
+                _serialize_agent_log(agent)
+                for agent in db.query(Agent).filter(Agent.agent_id == agent_id).all()
+            ]
+            task_snapshots = [
+                _serialize_task(task)
+                for task in db.query(Task).filter(Task.agent_id == agent_id).all()
+            ]
             db.query(Track).filter(Track.src_agent_id == agent_id).delete(
                 synchronize_session=False
             )
@@ -636,10 +854,23 @@ class ACFServer:
         finally:
             db.close()
 
-    def _cleanup_disconnected_agent_state(self, agent_id):
+        await self._send_task_del_logs(task_snapshots)
+        await self._send_publisher_track_del_logs(track_snapshots)
+        await self._send_agent_del_logs(agent_snapshots)
+
+    async def _cleanup_disconnected_agent_state(self, agent_id):
         """Remove transient state for a disconnected agent and mark it offline."""
         db = get_db()
         try:
+            track_snapshots = [
+                _serialize_track(track)
+                for track in db.query(Track).filter(Track.src_agent_id == agent_id).all()
+            ]
+            task_snapshots = [
+                _serialize_task(task)
+                for task in db.query(Task).filter(Task.agent_id == agent_id).all()
+            ]
+            agent_snapshot = None
             deleted_track_rows = (
                 db.query(Track)
                 .filter(Track.src_agent_id == agent_id)
@@ -653,10 +884,15 @@ class ACFServer:
             agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
             if agent:
                 agent.agent_status = "offline"
+                agent_snapshot = _serialize_agent_log(agent)
             db.commit()
         finally:
             db.close()
 
+        await self._send_task_del_logs(task_snapshots)
+        await self._send_publisher_track_del_logs(track_snapshots)
+        if agent_snapshot:
+            await self._send_agent_log("PublishAgent", agent_snapshot)
         self.connections.pop(agent_id, None)
         acf_logger.info(
             f"Cleared disconnected agent state for {agent_id}: "

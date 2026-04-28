@@ -60,6 +60,40 @@ def _serialize_agent(agent: Agent):
     }
 
 
+def _serialize_agent_log(agent: Agent):
+    """Build the element-log content for an agent row."""
+    return {
+        "agent_name": agent.agent_name,
+        "agent_id": agent.agent_id,
+        "agent_capability": agent.agent_capability or [],
+        "agent_status": agent.agent_status,
+        "priority": agent.priority,
+        "consent": {
+            "need_consumer_ue_authorization": False,
+            "need_producer_authorization": True,
+            "support_producer_ue_authorization": False,
+        },
+    }
+
+
+def _serialize_track(track: Track):
+    """Build a compact snapshot for a track row before deletion."""
+    return {
+        "src_agent_id": track.src_agent_id,
+        "task_id": track.task_id,
+        "track_list": track.track_list or [],
+    }
+
+
+def _serialize_task(task: Task):
+    """Build a compact snapshot for a task row."""
+    return {
+        "agent_id": task.agent_id,
+        "task_id": task.task_id,
+        "task_description": task.task_description,
+    }
+
+
 def _build_agent_info_response(agent: Agent):
     """Build the /arf/v1/agent-info response payload."""
     return {
@@ -71,14 +105,8 @@ def _build_agent_info_response(agent: Agent):
     }
 
 
-def _build_publish_agent_log_request(
-    agent_id: str,
-    agent_name: str,
-    agent_capabilities: list,
-    agent_status: str,
-    priority: int,
-):
-    """Build the element log request sent after agent registration."""
+def _build_agent_log_request(log_type, agent_snapshot):
+    """Build a PublishAgent/DeleteAgent element log request."""
     return {
         "method": "POST",
         "url": "/acn/v3/element-logs",
@@ -87,26 +115,36 @@ def _build_publish_agent_log_request(
         },
         "body": {
             "element_id": "AgentGW",
-            "log_type": "PublishAgent",
+            "log_type": log_type,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "content": agent_snapshot,
+        },
+    }
+
+
+def _build_task_log_request(log_type, task_snapshot):
+    """Build a TaskExecution/TaskExecutionTermination element log request."""
+    return {
+        "method": "POST",
+        "url": "/acn/v3/element-logs",
+        "headers": {
+            "Content-Type": "application/json",
+        },
+        "body": {
+            "element_id": "AgentGW",
+            "log_type": log_type,
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "content": {
-                "agent_name": agent_name,
-                "agent_id": agent_id,
-                "agent_capability": agent_capabilities,
-                "agent_status": agent_status,
-                "priority": priority,
-                "consent": {
-                    "need_consumer_ue_authorization": False,
-                    "need_producer_authorization": True,
-                    "support_producer_ue_authorization": False,
-                },
+                "agent_id": task_snapshot["agent_id"],
+                "task_id": task_snapshot["task_id"],
+                "task_description": task_snapshot["task_description"],
             },
         },
     }
 
 
-def _build_task_execution_log_request(body):
-    """Build the element log request sent after task execution starts."""
+def _build_publisher_track_log_request(log_type, track_snapshot):
+    """Build a PublisherTrackAdd/PublisherTrackDel element log request."""
     return {
         "method": "POST",
         "url": "/acn/v3/element-logs",
@@ -115,37 +153,72 @@ def _build_task_execution_log_request(body):
         },
         "body": {
             "element_id": "AgentGW",
-            "log_type": "TaskExecution",
-            "timestamp": body.get("timestamp", datetime.utcnow().isoformat() + "Z"),
+            "log_type": log_type,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
             "content": {
-                "agent_id": body.get("agent_id"),
-                "task_id": body.get("task_id"),
-                "task_description": body.get("description"),
+                "src_agent_id": track_snapshot["src_agent_id"],
+                "task_id": track_snapshot["task_id"],
+                "track_list": track_snapshot["track_list"],
             },
         },
     }
 
 
-def _build_task_execution_termination_log_request(body):
-    """Build the element log request sent after task execution terminates."""
-    return {
-        "method": "POST",
-        "url": "/acn/v3/element-logs",
-        "headers": {
-            "Content-Type": "application/json",
-        },
-        "body": {
-            "element_id": "AgentGW",
-            "log_type": "TaskExecutionTermination",
-            "timestamp": body.get("timestamp", datetime.utcnow().isoformat() + "Z"),
-            "content": {
-                "agent_id": body.get("agent_id"),
-                "task_id": body.get("task_id"),
-                "reason": body.get("reason"),
-                "force": body.get("force"),
-            },
-        },
-    }
+async def _send_agent_log(log_type, agent_snapshot):
+    """Send an agent table element log without failing the main flow."""
+    agent_log = _build_agent_log_request(log_type, agent_snapshot)
+    try:
+        async with _create_http_client() as client:
+            _log_http_message("HTTP SEND", "ARF", ELEMENT_LOGS_URL, agent_log)
+            response = await client.post(ELEMENT_LOGS_URL, json=agent_log)
+            _log_http_message(
+                "HTTP RECV",
+                ELEMENT_LOGS_URL,
+                "ARF",
+                {"status_code": response.status_code},
+            )
+            arf_logger.info(
+                f"Sent {log_type} for agent_id={agent_snapshot['agent_id']}: "
+                f"{response.status_code}"
+            )
+    except Exception as e:
+        arf_logger.info(
+            f"Error sending {log_type} for agent_id={agent_snapshot['agent_id']}: {e}"
+        )
+
+
+async def _send_agent_del_logs(agent_snapshots):
+    for agent_snapshot in agent_snapshots:
+        await _send_agent_log("DeleteAgent", agent_snapshot)
+
+
+async def _send_task_log(log_type, task_snapshot):
+    """Send a task lifecycle element log without failing the main flow."""
+    task_log = _build_task_log_request(log_type, task_snapshot)
+    try:
+        async with _create_http_client() as client:
+            _log_http_message("HTTP SEND", "ARF", ELEMENT_LOGS_URL, task_log)
+            response = await client.post(ELEMENT_LOGS_URL, json=task_log)
+            _log_http_message(
+                "HTTP RECV",
+                ELEMENT_LOGS_URL,
+                "ARF",
+                {"status_code": response.status_code},
+            )
+            arf_logger.info(
+                f"Sent {log_type} for task={task_snapshot['task_id']} "
+                f"agent_id={task_snapshot['agent_id']}: {response.status_code}"
+            )
+    except Exception as e:
+        arf_logger.info(
+            f"Error sending {log_type} for task={task_snapshot['task_id']} "
+            f"agent_id={task_snapshot['agent_id']}: {e}"
+        )
+
+
+async def _send_task_del_logs(task_snapshots):
+    for task_snapshot in task_snapshots:
+        await _send_task_log("TaskExecutionTermination", task_snapshot)
 
 
 def _get_agent_card_body(data):
@@ -234,6 +307,7 @@ async def register_agent_card(request: Request):
             )
 
         db = get_db()
+        agent_snapshot = None
         try:
             existing_agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
 
@@ -242,7 +316,7 @@ async def register_agent_card(request: Request):
                 existing_agent.agent_capability = capabilities
                 existing_agent.priority = priority
                 existing_agent.agent_status = existing_agent.agent_status or "offline"
-                agent_status = existing_agent.agent_status
+                agent_snapshot = _serialize_agent_log(existing_agent)
             else:
                 new_agent = Agent(
                     agent_id=agent_id,
@@ -252,7 +326,7 @@ async def register_agent_card(request: Request):
                     priority=priority,
                 )
                 db.add(new_agent)
-                agent_status = "offline"
+                agent_snapshot = _serialize_agent_log(new_agent)
 
             db.commit()
         finally:
@@ -262,30 +336,7 @@ async def register_agent_card(request: Request):
             f"Agent {agent_id} registered with capabilities: {capabilities}"
         )
 
-        try:
-            publish_agent_log = _build_publish_agent_log_request(
-                agent_id=agent_id,
-                agent_name=agent_name,
-                agent_capabilities=capabilities,
-                agent_status=agent_status,
-                priority=priority,
-            )
-            async with _create_http_client() as client:
-                _log_http_message(
-                    "HTTP SEND", "ARF", ELEMENT_LOGS_URL, publish_agent_log
-                )
-                response = await client.post(ELEMENT_LOGS_URL, json=publish_agent_log)
-                _log_http_message(
-                    "HTTP RECV",
-                    ELEMENT_LOGS_URL,
-                    "ARF",
-                    {"status_code": response.status_code},
-                )
-                arf_logger.info(
-                    f"Forwarded publish agent log for {agent_id}: {response.status_code}"
-                )
-        except Exception as e:
-            arf_logger.info(f"Error forwarding publish agent log: {e}")
+        await _send_agent_log("PublishAgent", agent_snapshot)
 
         return JSONResponse(status_code=200, content={"status": "OK"})
     except Exception as e:
@@ -370,6 +421,7 @@ async def handle_task_executions(request: Request):
         arf_logger.info(f"Received task execution from {agent_id} for task {task_id}")
 
         db = get_db()
+        task_snapshot = None
         try:
             existing_task = (
                 db.query(Task)
@@ -382,18 +434,21 @@ async def handle_task_executions(request: Request):
 
             if existing_task:
                 existing_task.task_description = description
+                task_snapshot = _serialize_task(existing_task)
             else:
-                db.add(
-                    Task(
-                        agent_id=agent_id,
-                        task_id=task_id,
-                        task_description=description,
-                    )
+                new_task = Task(
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    task_description=description,
                 )
+                db.add(new_task)
+                task_snapshot = _serialize_task(new_task)
 
             db.commit()
         finally:
             db.close()
+
+        await _send_task_log("TaskExecution", task_snapshot)
 
         try:
             async with _create_http_client() as client:
@@ -410,25 +465,6 @@ async def handle_task_executions(request: Request):
                 )
         except Exception as e:
             arf_logger.info(f"Error forwarding task execution to ACF: {e}")
-
-        try:
-            task_execution_log = _build_task_execution_log_request(body)
-            async with _create_http_client() as client:
-                _log_http_message(
-                    "HTTP SEND", "ARF", ELEMENT_LOGS_URL, task_execution_log
-                )
-                response = await client.post(ELEMENT_LOGS_URL, json=task_execution_log)
-                _log_http_message(
-                    "HTTP RECV",
-                    ELEMENT_LOGS_URL,
-                    "ARF",
-                    {"status_code": response.status_code},
-                )
-                arf_logger.info(
-                    f"Forwarded task execution log for {agent_id}: {response.status_code}"
-                )
-        except Exception as e:
-            arf_logger.info(f"Error forwarding task execution log: {e}")
 
         return JSONResponse(status_code=200, content={"status": "OK"})
     except Exception as e:
@@ -457,6 +493,7 @@ async def handle_task_execution_terminations(request: Request):
         )
 
         db = get_db()
+        task_snapshot = None
         try:
             existing_task = (
                 db.query(Task)
@@ -468,6 +505,7 @@ async def handle_task_execution_terminations(request: Request):
             )
 
             if existing_task:
+                task_snapshot = _serialize_task(existing_task)
                 db.delete(existing_task)
                 db.commit()
             else:
@@ -477,27 +515,8 @@ async def handle_task_execution_terminations(request: Request):
         finally:
             db.close()
 
-        try:
-            task_termination_log = _build_task_execution_termination_log_request(body)
-            async with _create_http_client() as client:
-                _log_http_message(
-                    "HTTP SEND", "ARF", ELEMENT_LOGS_URL, task_termination_log
-                )
-                response = await client.post(
-                    ELEMENT_LOGS_URL,
-                    json=task_termination_log,
-                )
-                _log_http_message(
-                    "HTTP RECV",
-                    ELEMENT_LOGS_URL,
-                    "ARF",
-                    {"status_code": response.status_code},
-                )
-                arf_logger.info(
-                    f"Forwarded task execution termination log for {agent_id}: {response.status_code}"
-                )
-        except Exception as e:
-            arf_logger.info(f"Error forwarding task execution termination log: {e}")
+        if task_snapshot:
+            await _send_task_log("TaskExecutionTermination", task_snapshot)
 
         return JSONResponse(status_code=200, content={"status": "OK"})
     except Exception as e:
@@ -528,6 +547,10 @@ async def handle_task_termination_broadcasts(request: Request):
 
         db = get_db()
         try:
+            task_snapshots = [
+                _serialize_task(task)
+                for task in db.query(Task).filter(Task.task_id == task_id).all()
+            ]
             db.query(Task).filter(Task.task_id == task_id).delete(
                 synchronize_session=False
             )
@@ -535,6 +558,8 @@ async def handle_task_termination_broadcasts(request: Request):
             arf_logger.info(f"Deleted task records for task_id={task_id}")
         finally:
             db.close()
+
+        await _send_task_del_logs(task_snapshots)
 
         try:
             termination_request = {
@@ -597,6 +622,14 @@ async def handle_agent_deletions(request: Request):
 
         db = get_db()
         try:
+            agent_snapshots = [
+                _serialize_agent_log(agent)
+                for agent in db.query(Agent).filter(Agent.agent_id == agent_id).all()
+            ]
+            task_snapshots = [
+                _serialize_task(task)
+                for task in db.query(Task).filter(Task.agent_id == agent_id).all()
+            ]
             db.query(Task).filter(Task.agent_id == agent_id).delete(
                 synchronize_session=False
             )
@@ -606,6 +639,9 @@ async def handle_agent_deletions(request: Request):
             db.commit()
         finally:
             db.close()
+
+        await _send_task_del_logs(task_snapshots)
+        await _send_agent_del_logs(agent_snapshots)
 
         try:
             async with _create_http_client() as client:
@@ -640,6 +676,18 @@ async def clear_environment(request: Request):
 
         db = get_db()
         try:
+            agent_snapshots = [
+                _serialize_agent_log(agent)
+                for agent in db.query(Agent).filter(Agent.agent_id.isnot(None)).all()
+            ]
+            task_snapshots = [
+                _serialize_task(task)
+                for task in db.query(Task).filter(Task.id.isnot(None)).all()
+            ]
+            track_snapshots = [
+                _serialize_track(track)
+                for track in db.query(Track).filter(Track.id.isnot(None)).all()
+            ]
             db.query(Task).filter(Task.id.isnot(None)).delete(synchronize_session=False)
             db.query(Track).filter(Track.id.isnot(None)).delete(
                 synchronize_session=False
@@ -650,6 +698,37 @@ async def clear_environment(request: Request):
             db.commit()
         finally:
             db.close()
+
+        await _send_task_del_logs(task_snapshots)
+        await _send_agent_del_logs(agent_snapshots)
+
+        for track_snapshot in track_snapshots:
+            try:
+                async with _create_http_client() as client:
+                    track_log = _build_publisher_track_log_request(
+                        "PublisherTrackDel",
+                        track_snapshot,
+                    )
+                    _log_http_message("HTTP SEND", "ARF", ELEMENT_LOGS_URL, track_log)
+                    response = await client.post(ELEMENT_LOGS_URL, json=track_log)
+                    _log_http_message(
+                        "HTTP RECV",
+                        ELEMENT_LOGS_URL,
+                        "ARF",
+                        {"status_code": response.status_code},
+                    )
+                    arf_logger.info(
+                        "Sent PublisherTrackDel for "
+                        f"task={track_snapshot['task_id']} "
+                        f"src_agent_id={track_snapshot['src_agent_id']}: "
+                        f"{response.status_code}"
+                    )
+            except Exception as e:
+                arf_logger.info(
+                    "Error sending PublisherTrackDel for "
+                    f"task={track_snapshot['task_id']} "
+                    f"src_agent_id={track_snapshot['src_agent_id']}: {e}"
+                )
 
         try:
             async with _create_http_client() as client:
