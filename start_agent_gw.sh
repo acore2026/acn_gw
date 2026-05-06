@@ -5,6 +5,7 @@ set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PID_FILE="$SCRIPT_DIR/.agent_gw.pid"
+APP_LOG_DIR="$SCRIPT_DIR/agent_gw/logs"
 START_LOG="$SCRIPT_DIR/logs/agent_gw_start.log"
 APP_LOG_DIR="$SCRIPT_DIR/logs"
 PROCESS_PATTERN='[p]ython3 .*agent_gw\.py'

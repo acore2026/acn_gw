@@ -4,6 +4,12 @@ env/
 ENV/
 .venv/
 
+# Local agent/tool state
+.agent_gw.pid
+.codex
+.agents/
+.ruff_cache/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -55,6 +61,13 @@ logs/
 
 # Relay cache
 .relay_cache/
+*.sqlite
+
+# External/local dependencies
+# The MOQT library is expected to exist locally at ./moq for runtime,
+# but it is maintained outside this repository.
+moq/
+moq-backup/
 
 # Certificates (self-signed)
 *.pem
