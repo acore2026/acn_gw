@@ -6,7 +6,10 @@ Agent GW 是一个 Python 后端应用，包含三个运行实体：
 - ACF（Agent Communication Function）：WebSocket 服务，默认端口 `9002`
 - MOQT Relay：基于 QUIC 的 MOQT Relay 服务，默认端口 `9003`
 
-根目录的 `agent_gw.py` 是统一启动入口，实际业务代码在 `agent_gw/`，MOQT 协议实现以 vendored package 的形式放在 `moq/`。
+根目录的 `agent_gw.py` 是统一启动入口，实际业务代码在 `agent_gw/`。
+
+注意：MOQT 协议实现来自外部依赖库，运行时需要在项目根目录准备本地 `moq/`
+目录，但该目录已在 `.gitignore` 中忽略，不随当前仓库上传。
 
 ## 快速启动
 
@@ -50,19 +53,23 @@ python3 agent_gw.py
 │   ├── acf_server.py        # ACF WebSocket 服务
 │   ├── models.py            # SQLAlchemy 模型和 SQLite 配置
 │   └── logger_config.py     # 日志配置
-├── moq/                     # MOQT 协议库和 Relay 实现，运行 MOQT 必需
-│   ├── encoding/            # VarInt、KV、Location 等编码工具
-│   ├── messages/            # MOQT 控制消息和数据消息
-│   ├── pub/                 # Publisher 相关实现
-│   ├── relay/               # MOQRelay 实现
-│   ├── session/             # Session、Role、订阅/发布状态
-│   ├── sub/                 # Subscriber 相关实现
-│   └── transport/           # QUIC transport
 ├── docs/                    # 项目文档
-├── tests/                   # 测试代码和测试夹带的样例/复制代码
-├── logs/                    # 运行日志，启动后生成
-├── venv/                    # 本地 Python 虚拟环境，setup.sh 生成
-└── moq-backup/              # 备份/历史残留目录，当前运行不依赖
+└── tests/                   # 测试代码
+```
+
+本地运行时可能还会看到以下目录或文件，它们不属于当前仓库上传内容：
+
+```text
+.
+├── moq/                     # 本地外部 MOQT 依赖库，运行 MOQT Relay 必需
+├── logs/                    # 根目录启动日志
+├── agent_gw/logs/           # 应用日志
+├── agent_gw/agent_gw.db     # 本地 SQLite 数据库
+├── venv/                    # 本地 Python 虚拟环境
+├── .agent_gw.pid            # 后台进程 PID 文件
+├── .pytest_cache/           # pytest 缓存
+├── .ruff_cache/             # ruff 缓存
+└── .relay_cache/            # Relay 缓存
 ```
 
 ## 运行时必需文件
@@ -71,14 +78,15 @@ python3 agent_gw.py
 
 - `agent_gw.py`
 - `agent_gw/`
-- `moq/`
 - `requirements.txt`
 - `start_agent_gw.sh`（如果使用后台管理脚本）
 - `setup.sh`（仅初始化环境时需要，运行中不直接依赖）
+- 本地 `moq/` 外部依赖目录（不随当前仓库上传）
 
 说明：
 
 - `agent_gw/main.py` 会把根目录下的 `moq/` 加入 `sys.path`，所以 `moq/` 不能删除，否则 MOQT Relay 无法启动。
+- `moq/` 是外部依赖库的本地副本；克隆当前仓库后，需要额外复制或克隆该目录到项目根目录。
 - `agent_gw/models.py` 默认在 `agent_gw/agent_gw.db` 使用 SQLite 数据库；数据库文件可以不存在，程序会按模型初始化创建。
 - `agent_gw/logs/` 和根目录 `logs/` 可不存在，启动时会按日志配置和启动脚本创建。
 
@@ -88,10 +96,11 @@ python3 agent_gw.py
 
 | 路径 | 类型 | 说明 |
 | --- | --- | --- |
-| `tests/` | 测试 | pytest 测试代码；其中还包含 `tests/agent_gw/`、`tests/moq/`、`tests/docs/` 等测试夹带内容，不作为正式运行入口 |
+| `tests/` | 测试 | pytest 测试代码；运行服务不依赖，但建议在开发仓库中保留 |
 | `docs/` | 文档 | 项目说明、测试说明和总结文档；运行服务不依赖 |
 | `AGENTS.md` | 开发规范 | 给 AI coding agent 使用的工作说明；运行服务不依赖 |
-| `moq-backup/` | 备份/历史残留 | 当前 `agent_gw/main.py` 不引用该目录；不是运行必需 |
+| `moq/` | 外部依赖 | 当前仓库不跟踪；运行 MOQT Relay 前需要本地准备 |
+| `moq-backup/` | 备份/历史残留 | 当前仓库不跟踪；运行服务不依赖 |
 | `venv/` | 本地环境 | 可重新通过 `setup.sh` 或 `python3 -m venv venv` 生成；部署时通常重建环境 |
 | `.pytest_cache/`、`.ruff_cache/` | 工具缓存 | pytest/ruff 生成的缓存 |
 | `__pycache__/`、`*.pyc` | Python 缓存 | Python 自动生成，可删除 |
@@ -109,6 +118,13 @@ python3 agent_gw.py
 ```bash
 ./setup.sh
 source venv/bin/activate
+```
+
+准备 MOQT 外部依赖：
+
+```bash
+# 将 MOQT 依赖库复制或克隆到项目根目录，最终路径应为 ./moq
+# 目录内需要能提供 `from moq import MOQRelay` 所需的 Python package。
 ```
 
 启动全部服务：
@@ -163,4 +179,6 @@ find . -name '__pycache__' -type d -prune -exec rm -rf {} +
 find . -name '*.pyc' -delete
 ```
 
-如果要准备一个更小的部署包，通常保留 `agent_gw.py`、`agent_gw/`、`moq/`、`requirements.txt` 和必要启动脚本即可；`tests/`、`docs/`、缓存、日志、数据库文件和本地工具状态都可以不包含。
+如果要准备一个更小的部署包，通常保留当前仓库中的 `agent_gw.py`、`agent_gw/`、
+`requirements.txt` 和必要启动脚本，并在部署环境额外准备 `moq/` 外部依赖即可；
+`tests/`、`docs/`、缓存、日志、数据库文件和本地工具状态都可以不包含。
