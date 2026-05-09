@@ -7,6 +7,7 @@ Three functional entities:
 - MOQT Relay: MOQT protocol on port 9003
 """
 
+import os
 from sqlalchemy import (
     create_engine,
     Column,
@@ -68,7 +69,9 @@ class Track(Base):
     track_list = Column(JSON)  # List of tracks
 
 # Database setup
-DB_PATH = Path(__file__).resolve().parent / 'agent_gw.db'
+DB_PATH = Path(
+    os.getenv('AGENT_GW_DB_PATH', Path(__file__).resolve().parent / 'agent_gw.db')
+)
 engine = create_engine(f'sqlite:///{DB_PATH}', echo=False)
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)

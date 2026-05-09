@@ -7,9 +7,13 @@ import pytest
 import asyncio
 import sys
 import os
+from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+TEST_DB_PATH = Path('/tmp/agent_gw_test.db')
+os.environ['AGENT_GW_DB_PATH'] = str(TEST_DB_PATH)
 
 # Configure pytest-asyncio
 @pytest.fixture(scope="session")
@@ -31,6 +35,16 @@ def reset_database():
     yield
     # Cleanup after test
     Base.metadata.drop_all(engine)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_database():
+    """Remove the isolated test database file when the test session ends."""
+    yield
+    try:
+        TEST_DB_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 @pytest.fixture
 def test_agent_data():
