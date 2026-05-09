@@ -168,6 +168,58 @@ pytest tests/test_moqt_relay.py -v
 | ACF | `9002` | WebSocket |
 | MOQT Relay | `9003` | QUIC / MOQT |
 
+## `element-logs` 上报
+
+ARF 和 ACF 都会把运行中的 agent 状态上报到 `element-logs` 服务。当前默认地址是：
+
+```text
+https://localhost:9005/acn/v3/element-logs
+```
+
+可以通过环境变量覆盖：
+
+```bash
+export ELEMENT_LOGS_URL="https://your-element-logs-host:9005/acn/v3/element-logs"
+```
+
+当前 HTTP 客户端会使用系统代理环境变量，并且不校验证书。
+
+### 上报格式
+
+外层请求是统一的包裹结构：
+
+```json
+{
+  "method": "POST",
+  "url": "/acn/v3/element-logs",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "element_id": "AgentGW",
+    "log_type": "PublishAgent",
+    "timestamp": "2026-05-09T12:00:00Z",
+    "content": {}
+  }
+}
+```
+
+`PublishAgent` 的 `content` 字段目前两边基本一致，都会包含：
+
+- `agent_id`
+- `agent_name`
+- `agent_capability`
+- `agent_status`
+- `setup_at`
+- `priority`
+- `consent`
+
+### ARF 和 ACF 的区别
+
+- ARF 在 agent card 注册成功后上报 `PublishAgent`，通常 `agent_status` 是 `offline`，`setup_at` 为空。
+- ACF 在 agent `SETUP` 成功后上报 `PublishAgent`，通常 `agent_status` 是 `online`，`setup_at` 是实际连接时间。
+- 两边的请求格式相同，差异主要在触发时机和字段值。
+
 ## 清理建议
 
 只清理运行产物和缓存时可以使用：
