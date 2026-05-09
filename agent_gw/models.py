@@ -10,6 +10,7 @@ Three functional entities:
 from sqlalchemy import (
     create_engine,
     Column,
+    DateTime,
     String,
     Integer,
     JSON,
@@ -33,6 +34,7 @@ class Agent(Base):
     agent_capability = Column(JSON)  # List of strings
     agent_auth = Column(String)
     agent_status = Column(String, default='offline')  # online, offline
+    setup_at = Column(DateTime)
     priority = Column(Integer, default=0)
     
     tasks = relationship("Task", back_populates="agent")
@@ -112,6 +114,19 @@ def _migrate_tracks_unique_constraint():
 
 
 _migrate_tracks_unique_constraint()
+
+
+def _add_column_if_missing(table_name, column_name, ddl):
+    """Add a column to an existing SQLite table when upgrading old databases."""
+    with engine.begin() as connection:
+        columns = connection.execute(text(f'PRAGMA table_info("{table_name}")')).fetchall()
+        column_names = [column[1] for column in columns]
+        if column_name not in column_names:
+            connection.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {ddl}'))
+
+
+_add_column_if_missing('agents', 'setup_at', 'setup_at DATETIME')
+
 
 def get_db():
     return SessionLocal()

@@ -7,6 +7,7 @@ Handles agent registration, discovery, and task lifecycle
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import List
 
@@ -22,18 +23,23 @@ from .models import Agent, Task, Track, get_db
 app = FastAPI(title="ARF - Agent Repository Function")
 
 IDM_URL = "http://10.0.18.210:9020/idm/v1/vc-verifications"
-ELEMENT_LOGS_URL = "http://localhost:9005/acn/v3/element-logs"
 ACF_DISCOVERIES_URL = "http://localhost:9002/acf/v1/discoveries"
 ACF_TASK_EXECUTIONS_URL = "http://localhost:9002/acn-agent/v1/task-executions"
 ACF_CLEAR_URL = "http://localhost:9002/clear"
 ACF_AGENT_DELETIONS_URL = "http://localhost:9002/acn-agent/v1/agent-deletions"
 ACF_TASK_TERMINATION_URL = "http://localhost:9002/acf/v1/task-termination"
 ACN_AGENT_CLEAR_URL = "http://localhost:9010/clear"
+DEFAULT_ELEMENT_LOGS_URL = "https://localhost:9005/acn/v3/element-logs"
+
+
+def _get_element_logs_url():
+    """Return the configured element-logs endpoint."""
+    return os.getenv("ELEMENT_LOGS_URL", DEFAULT_ELEMENT_LOGS_URL)
 
 
 def _create_http_client():
-    """Create an HTTP client that ignores ambient proxy settings by default."""
-    return httpx.AsyncClient(trust_env=False)
+    """Create an HTTP client with disabled certificate verification."""
+    return httpx.AsyncClient(verify=False)
 
 
 def _format_log_payload(data):
@@ -56,6 +62,7 @@ def _serialize_agent(agent: Agent):
         "agent_name": agent.agent_name,
         "agent_status": agent.agent_status,
         "agent_capability": agent.agent_capability or [],
+        "setup_at": agent.setup_at.isoformat() + "Z" if agent.setup_at else None,
         "priority": agent.priority,
     }
 
@@ -67,6 +74,7 @@ def _serialize_agent_log(agent: Agent):
         "agent_id": agent.agent_id,
         "agent_capability": agent.agent_capability or [],
         "agent_status": agent.agent_status,
+        "setup_at": agent.setup_at.isoformat() + "Z" if agent.setup_at else None,
         "priority": agent.priority,
         "consent": {
             "need_consumer_ue_authorization": False,
@@ -167,13 +175,14 @@ def _build_publisher_track_log_request(log_type, track_snapshot):
 async def _send_agent_log(log_type, agent_snapshot):
     """Send an agent table element log without failing the main flow."""
     agent_log = _build_agent_log_request(log_type, agent_snapshot)
+    element_logs_url = _get_element_logs_url()
     try:
         async with _create_http_client() as client:
-            _log_http_message("HTTP SEND", "ARF", ELEMENT_LOGS_URL, agent_log)
-            response = await client.post(ELEMENT_LOGS_URL, json=agent_log)
+            _log_http_message("HTTP SEND", "ARF", element_logs_url, agent_log)
+            response = await client.post(element_logs_url, json=agent_log)
             _log_http_message(
                 "HTTP RECV",
-                ELEMENT_LOGS_URL,
+                element_logs_url,
                 "ARF",
                 {"status_code": response.status_code},
             )
@@ -195,13 +204,14 @@ async def _send_agent_del_logs(agent_snapshots):
 async def _send_task_log(log_type, task_snapshot):
     """Send a task lifecycle element log without failing the main flow."""
     task_log = _build_task_log_request(log_type, task_snapshot)
+    element_logs_url = _get_element_logs_url()
     try:
         async with _create_http_client() as client:
-            _log_http_message("HTTP SEND", "ARF", ELEMENT_LOGS_URL, task_log)
-            response = await client.post(ELEMENT_LOGS_URL, json=task_log)
+            _log_http_message("HTTP SEND", "ARF", element_logs_url, task_log)
+            response = await client.post(element_logs_url, json=task_log)
             _log_http_message(
                 "HTTP RECV",
-                ELEMENT_LOGS_URL,
+                element_logs_url,
                 "ARF",
                 {"status_code": response.status_code},
             )
@@ -704,16 +714,17 @@ async def clear_environment(request: Request):
 
         for track_snapshot in track_snapshots:
             try:
+                element_logs_url = _get_element_logs_url()
                 async with _create_http_client() as client:
                     track_log = _build_publisher_track_log_request(
                         "PublisherTrackDel",
                         track_snapshot,
                     )
-                    _log_http_message("HTTP SEND", "ARF", ELEMENT_LOGS_URL, track_log)
-                    response = await client.post(ELEMENT_LOGS_URL, json=track_log)
+                    _log_http_message("HTTP SEND", "ARF", element_logs_url, track_log)
+                    response = await client.post(element_logs_url, json=track_log)
                     _log_http_message(
                         "HTTP RECV",
-                        ELEMENT_LOGS_URL,
+                        element_logs_url,
                         "ARF",
                         {"status_code": response.status_code},
                     )
@@ -839,7 +850,13 @@ async def process_discovery(
             arf_logger.info("No agents with matching capabilities found")
             return
 
-        scored_agents.sort(key=lambda item: (-item[0].priority, -item[1]))
+        scored_agents.sort(
+            key=lambda item: (
+                -item[0].priority,
+                -item[1],
+                -(item[0].setup_at.timestamp() if item[0].setup_at else 0),
+            )
+        )
         selected_agent = scored_agents[0][0]
         requester_agent = (
             db.query(Agent).filter(Agent.agent_id == requester_agent_id).first()

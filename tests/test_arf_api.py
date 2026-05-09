@@ -4,6 +4,7 @@ Unit tests for ARF HTTP API
 """
 
 import asyncio
+from datetime import datetime, timedelta
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 import sys
@@ -97,7 +98,8 @@ class TestAgentCardRegistration:
         first_call = mock_client.post.await_args_list[0]
         second_call = mock_client.post.await_args_list[1]
         assert first_call.args[0] == "http://10.0.18.210:9020/idm/v1/vc-verifications"
-        assert second_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert second_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
+        assert mock_async_client.call_args.kwargs["verify"] is False
         assert second_call.kwargs["json"]["url"] == "/acn/v3/element-logs"
         assert second_call.kwargs["json"]["body"]["element_id"] == "AgentGW"
         assert second_call.kwargs["json"]["body"]["log_type"] == "PublishAgent"
@@ -164,7 +166,7 @@ class TestAgentCardRegistration:
         assert response.json()["status"] == "OK"
         assert mock_client.post.await_count == 2
         second_call = mock_client.post.await_args_list[1]
-        assert second_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert second_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert second_call.kwargs["json"]["body"]["content"]["agent_capability"] == ["6G业务开通", "声光驱离"]
         assert second_call.kwargs["json"]["body"]["content"]["agent_status"] == "offline"
         assert second_call.kwargs["json"]["body"]["content"]["priority"] == 4
@@ -497,6 +499,54 @@ class TestAgentDiscovery:
         assert kwargs["json"]["body"]["dst_agent_id"] == "agent-speaker-001"
 
     @pytest.mark.asyncio
+    @patch('agent_gw.arf_server.httpx.AsyncClient')
+    async def test_process_discovery_prefers_latest_setup_at_on_tie(
+        self,
+        mock_async_client,
+    ):
+        """Test discovery tie-breaks same priority and capability score by latest SETUP."""
+        db = SessionLocal()
+        older_setup = datetime.utcnow() - timedelta(minutes=10)
+        newer_setup = datetime.utcnow()
+        db.add_all([
+            Agent(
+                agent_id="agent-older",
+                agent_name="Older Agent",
+                agent_capability=["声光驱离"],
+                agent_status="online",
+                priority=4,
+                setup_at=older_setup,
+            ),
+            Agent(
+                agent_id="agent-newer",
+                agent_name="Newer Agent",
+                agent_capability=["声光驱离"],
+                agent_status="online",
+                priority=4,
+                setup_at=newer_setup,
+            ),
+        ])
+        db.commit()
+        db.close()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        await process_discovery(
+            requester_agent_id="did:acn:agent:requester",
+            task_id="task-discovery-latest-setup",
+            required_capabilities=["声光驱离"],
+        )
+
+        assert mock_client.post.await_count == 1
+        _, kwargs = mock_client.post.call_args
+        assert kwargs["json"]["body"]["dst_agent_id"] == "agent-newer"
+
+    @pytest.mark.asyncio
     async def test_process_discovery_logs_saved_agents_when_no_candidates(self, caplog):
         """Test no-candidate discovery logs the saved agent snapshot."""
         db = SessionLocal()
@@ -707,7 +757,7 @@ class TestTaskExecution:
         assert acf_call.args[0] == "http://localhost:9002/acn-agent/v1/task-executions"
         assert acf_call.kwargs["json"]["body"]["task_id"] == "task-exec-forward"
         assert acf_call.kwargs["json"]["body"]["agent_id"] == "did:acn:agent:exec-forward"
-        assert element_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert element_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = element_log_call.kwargs["json"]
         assert element_log["url"] == "/acn/v3/element-logs"
         assert element_log["body"]["element_id"] == "AgentGW"
@@ -765,19 +815,19 @@ class TestEnvironmentReset:
         task_log_call = mock_client.post.await_args_list[0]
         agent_log_call = mock_client.post.await_args_list[1]
         track_log_call = mock_client.post.await_args_list[2]
-        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
         assert task_log_call.kwargs["json"]["body"]["content"] == {
             "agent_id": "did:acn:agent:clear-001",
             "task_id": "task-clear-001",
             "task_description": "Clear task",
         }
-        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
         assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
             "did:acn:agent:clear-001"
         )
-        assert track_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert track_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert track_log_call.kwargs["json"]["body"]["log_type"] == "PublisherTrackDel"
         assert track_log_call.kwargs["json"]["body"]["content"] == {
             "src_agent_id": "did:acn:agent:clear-001",
@@ -833,19 +883,19 @@ class TestEnvironmentReset:
         task_log_call = mock_client.post.await_args_list[0]
         agent_log_call = mock_client.post.await_args_list[1]
         track_log_call = mock_client.post.await_args_list[2]
-        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
         assert task_log_call.kwargs["json"]["body"]["content"] == {
             "agent_id": "did:acn:agent:clear-flat-001",
             "task_id": "task-clear-flat-001",
             "task_description": "Clear flat task",
         }
-        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
         assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
             "did:acn:agent:clear-flat-001"
         )
-        assert track_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert track_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert track_log_call.kwargs["json"]["body"]["log_type"] == "PublisherTrackDel"
         assert track_log_call.kwargs["json"]["body"]["content"] == {
             "src_agent_id": "did:acn:agent:clear-flat-001",
@@ -906,14 +956,14 @@ class TestEnvironmentReset:
         task_log_call = mock_client.post.await_args_list[0]
         agent_log_call = mock_client.post.await_args_list[1]
         forward_call = mock_client.post.await_args_list[2]
-        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
         assert task_log_call.kwargs["json"]["body"]["content"] == {
             "agent_id": "did:acn:agent:delete-001",
             "task_id": "task-delete-001",
             "task_description": "Delete task",
         }
-        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
         assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
             "did:acn:agent:delete-001"
@@ -965,14 +1015,14 @@ class TestEnvironmentReset:
         assert mock_client.post.await_count == 3
         task_log_call = mock_client.post.await_args_list[0]
         agent_log_call = mock_client.post.await_args_list[1]
-        assert task_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert task_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert task_log_call.kwargs["json"]["body"]["log_type"] == "TaskExecutionTermination"
         assert task_log_call.kwargs["json"]["body"]["content"] == {
             "agent_id": "did:acn:agent:delete-002",
             "task_id": "task-delete-002",
             "task_description": "Delete task wrapped",
         }
-        assert agent_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert agent_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         assert agent_log_call.kwargs["json"]["body"]["log_type"] == "DeleteAgent"
         assert agent_log_call.kwargs["json"]["body"]["content"]["agent_id"] == (
             "did:acn:agent:delete-002"
@@ -1148,7 +1198,7 @@ class TestEnvironmentReset:
         assert response.status_code == 200
         assert mock_client.post.await_count == 1
         element_log_call = mock_client.post.await_args_list[0]
-        assert element_log_call.args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert element_log_call.args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = element_log_call.kwargs["json"]
         assert element_log["url"] == "/acn/v3/element-logs"
         assert element_log["body"]["element_id"] == "AgentGW"

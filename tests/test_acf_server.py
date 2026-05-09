@@ -69,6 +69,7 @@ class TestACFSetup:
         db = SessionLocal()
         agent = db.query(Agent).filter_by(agent_id="did:acn:agent:test001").first()
         assert agent.agent_status == "online"
+        assert agent.setup_at is not None
         db.close()
         
         # Verify response sent
@@ -79,11 +80,13 @@ class TestACFSetup:
 
         mock_client.post.assert_awaited_once()
         args, kwargs = mock_client.post.call_args
-        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert args[0] == "https://localhost:9005/acn/v3/element-logs"
+        assert mock_async_client.call_args.kwargs["verify"] is False
         element_log = kwargs["json"]
         assert element_log["body"]["log_type"] == "PublishAgent"
         assert element_log["body"]["content"]["agent_id"] == "did:acn:agent:test001"
         assert element_log["body"]["content"]["agent_status"] == "online"
+        assert element_log["body"]["content"]["setup_at"] is not None
     
     async def test_handle_setup_duplicate_connection(self, acf_server):
         """Test SETUP message when agent already connected"""
@@ -375,7 +378,7 @@ class TestACFMessageForwarding:
 
         mock_client.post.assert_awaited_once()
         args, kwargs = mock_client.post.call_args
-        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = kwargs["json"]
         assert element_log["url"] == "/acn/v3/element-logs"
         assert element_log["body"]["element_id"] == "AgentGW"
@@ -872,7 +875,7 @@ class TestACFMessageForwarding:
         assert response.status_code == 200
         assert mock_client.post.await_count == 2
         args, kwargs = mock_client.post.await_args_list[0]
-        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = kwargs["json"]
         assert element_log["body"]["log_type"] == "PublisherTrackDel"
         assert element_log["body"]["content"] == {
@@ -883,7 +886,7 @@ class TestACFMessageForwarding:
             ],
         }
         args, kwargs = mock_client.post.await_args_list[1]
-        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = kwargs["json"]
         assert element_log["body"]["log_type"] == "DeleteAgent"
         assert element_log["body"]["content"]["agent_id"] == "agent-delete-log"
@@ -920,7 +923,7 @@ class TestACFMessageForwarding:
         assert response.status_code == 200
         assert mock_client.post.await_count == 2
         args, kwargs = mock_client.post.await_args_list[0]
-        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = kwargs["json"]
         assert element_log["body"]["log_type"] == "TaskExecutionTermination"
         assert element_log["body"]["content"] == {
@@ -929,7 +932,7 @@ class TestACFMessageForwarding:
             "task_description": "Task delete log",
         }
         args, kwargs = mock_client.post.await_args_list[1]
-        assert args[0] == "http://localhost:9005/acn/v3/element-logs"
+        assert args[0] == "https://localhost:9005/acn/v3/element-logs"
         element_log = kwargs["json"]
         assert element_log["body"]["log_type"] == "DeleteAgent"
         assert element_log["body"]["content"]["agent_id"] == "agent-task-delete-log"

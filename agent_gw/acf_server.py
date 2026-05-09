@@ -7,6 +7,7 @@ Manages WebSocket connections for agents and discovery requests from ARF
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from contextlib import suppress
 
@@ -18,12 +19,17 @@ from fastapi.responses import JSONResponse
 from .logger_config import acf_logger
 from .models import Agent, Task, Track, get_db
 
-ELEMENT_LOGS_URL = "http://localhost:9005/acn/v3/element-logs"
+DEFAULT_ELEMENT_LOGS_URL = "https://localhost:9005/acn/v3/element-logs"
+
+
+def _get_element_logs_url():
+    """Return the configured element-logs endpoint."""
+    return os.getenv("ELEMENT_LOGS_URL", DEFAULT_ELEMENT_LOGS_URL)
 
 
 def _create_http_client():
-    """Create an HTTP client that ignores ambient proxy settings by default."""
-    return httpx.AsyncClient(trust_env=False, timeout=0.2)
+    """Create an HTTP client with disabled certificate verification."""
+    return httpx.AsyncClient(verify=False, timeout=0.2)
 
 
 def _format_log_payload(data):
@@ -64,6 +70,7 @@ def _serialize_agent_log(agent: Agent):
         "agent_id": agent.agent_id,
         "agent_capability": agent.agent_capability or [],
         "agent_status": agent.agent_status,
+        "setup_at": agent.setup_at.isoformat() + "Z" if agent.setup_at else None,
         "priority": agent.priority,
         "consent": {
             "need_consumer_ue_authorization": False,
@@ -185,13 +192,14 @@ class ACFServer:
     async def _send_publisher_track_log(self, log_type, track_snapshot):
         """Send a publisher track element log without failing the main flow."""
         log_request = _build_publisher_track_log_request(log_type, track_snapshot)
+        element_logs_url = _get_element_logs_url()
         try:
             async with _create_http_client() as client:
-                _log_message("HTTP SEND", "ACF", ELEMENT_LOGS_URL, log_request)
-                response = await client.post(ELEMENT_LOGS_URL, json=log_request)
+                _log_message("HTTP SEND", "ACF", element_logs_url, log_request)
+                response = await client.post(element_logs_url, json=log_request)
                 _log_message(
                     "HTTP RECV",
-                    ELEMENT_LOGS_URL,
+                    element_logs_url,
                     "ACF",
                     {"status_code": response.status_code},
                 )
@@ -213,13 +221,14 @@ class ACFServer:
     async def _send_agent_log(self, log_type, agent_snapshot):
         """Send an agent table element log without failing the main flow."""
         agent_log = _build_agent_log_request(log_type, agent_snapshot)
+        element_logs_url = _get_element_logs_url()
         try:
             async with _create_http_client() as client:
-                _log_message("HTTP SEND", "ACF", ELEMENT_LOGS_URL, agent_log)
-                response = await client.post(ELEMENT_LOGS_URL, json=agent_log)
+                _log_message("HTTP SEND", "ACF", element_logs_url, agent_log)
+                response = await client.post(element_logs_url, json=agent_log)
                 _log_message(
                     "HTTP RECV",
-                    ELEMENT_LOGS_URL,
+                    element_logs_url,
                     "ACF",
                     {"status_code": response.status_code},
                 )
@@ -239,13 +248,14 @@ class ACFServer:
     async def _send_task_log(self, log_type, task_snapshot):
         """Send a task lifecycle element log without failing the main flow."""
         task_log = _build_task_log_request(log_type, task_snapshot)
+        element_logs_url = _get_element_logs_url()
         try:
             async with _create_http_client() as client:
-                _log_message("HTTP SEND", "ACF", ELEMENT_LOGS_URL, task_log)
-                response = await client.post(ELEMENT_LOGS_URL, json=task_log)
+                _log_message("HTTP SEND", "ACF", element_logs_url, task_log)
+                response = await client.post(element_logs_url, json=task_log)
                 _log_message(
                     "HTTP RECV",
-                    ELEMENT_LOGS_URL,
+                    element_logs_url,
                     "ACF",
                     {"status_code": response.status_code},
                 )
@@ -346,6 +356,7 @@ class ACFServer:
             agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
             if agent:
                 agent.agent_status = "online"
+                agent.setup_at = datetime.utcnow()
                 agent_snapshot = _serialize_agent_log(agent)
                 db.commit()
         finally:
